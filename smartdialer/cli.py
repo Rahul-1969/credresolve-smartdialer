@@ -8,11 +8,23 @@ Single Responsibility:
 import argparse
 import sys
 
+from smartdialer.db import connect, init_schema
+
 
 def cmd_init_db(args: argparse.Namespace) -> int:
     """Initialize the SQLite database schema."""
-    print("not implemented yet")
-    return 0
+    db_path = getattr(args, "db", "smartdialer.db")
+    conn = connect(db_path)
+    try:
+        init_schema(conn)
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
+        )
+        tables = [row["name"] for row in cur.fetchall()]
+        print(f"Initialized database at '{db_path}'. Tables: {', '.join(tables)}")
+        return 0
+    finally:
+        conn.close()
 
 
 def cmd_simulate(args: argparse.Namespace) -> int:
@@ -36,6 +48,11 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
 
     init_db_parser = subparsers.add_parser("init-db", help="Initialize the database")
+    init_db_parser.add_argument(
+        "--db",
+        default="smartdialer.db",
+        help="Path to SQLite database file (default: smartdialer.db)",
+    )
     init_db_parser.set_defaults(func=cmd_init_db)
 
     simulate_parser = subparsers.add_parser("simulate", help="Run campaign simulation")
@@ -55,4 +72,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
