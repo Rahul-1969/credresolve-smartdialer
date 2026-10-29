@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smartdialer"
+version = "0.1.0"
+description = "Collections dialer prototype with progressive and predictive pacing and a separate safety controller"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Rahul" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+smartdialer = "smartdialer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["smartdialer*"]

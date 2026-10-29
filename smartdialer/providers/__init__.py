@@ -1,0 +1,2 @@
+"""Telecom provider adapters subpackage."""
+
