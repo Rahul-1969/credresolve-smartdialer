@@ -205,12 +205,13 @@ class AgentRepo:
         to_state: AgentState | str,
         worker_id: str | None = None,
         call_id: str | None = None,
+        expect_call_id: str | None = None,
     ) -> bool:
         """Transition an agent from from_state to to_state.
 
         Raises IllegalTransition if the transition violates ALLOWED_TRANSITIONS.
         Returns True if the transition was applied (rowcount == 1).
-        Returns False if the agent was not in from_state (lost race or stale view).
+        Returns False if the agent was not in from_state or expect_call_id did not match.
         """
         from_enum = AgentState(from_state) if not isinstance(from_state, AgentState) else from_state
         to_enum = AgentState(to_state) if not isinstance(to_state, AgentState) else to_state
@@ -231,7 +232,7 @@ class AgentRepo:
         else:
             set_clauses.append("available_since = NULL")
 
-        if from_enum == AgentState.RESERVED:
+        if to_enum in (AgentState.AVAILABLE, AgentState.PAUSED, AgentState.OFFLINE):
             set_clauses.append("reserved_by = NULL")
             set_clauses.append("lease_expires_at = NULL")
             set_clauses.append("reserved_call_id = NULL")
@@ -242,20 +243,33 @@ class AgentRepo:
             params.append(call_id)
             set_clauses.append("lease_expires_at = ?")
             params.append(now + self.config.agent_reservation_lease_seconds)
+        else:
+            # DIALING, CONNECTED, WRAP_UP:
+            # Keep reserved_call_id and reserved_by as is.
+            # Clear lease_expires_at on DIALING/CONNECTED/WRAP_UP.
+            set_clauses.append("lease_expires_at = NULL")
 
-        params.extend([agent_id, from_enum.value])
-        sql = f"UPDATE agents SET {', '.join(set_clauses)} WHERE id = ? AND state = ?;"
+        where_clauses = ["id = ?", "state = ?"]
+        where_params: list[Any] = [agent_id, from_enum.value]
+
+        if expect_call_id is not None:
+            where_clauses.append("reserved_call_id = ?")
+            where_params.append(expect_call_id)
+
+        params.extend(where_params)
+        sql = f"UPDATE agents SET {', '.join(set_clauses)} WHERE {' AND '.join(where_clauses)};"
 
         def _op() -> bool:
             with transaction(self.conn):
                 cur = self.conn.execute(sql, params)
                 if cur.rowcount == 1:
+                    effective_call_id = call_id or expect_call_id
                     self.conn.execute(
                         """
                         INSERT INTO agent_events (agent_id, from_state, to_state, worker_id, call_id, at)
                         VALUES (?, ?, ?, ?, ?, ?);
                         """,
-                        (agent_id, from_enum.value, to_enum.value, worker_id, call_id, now),
+                        (agent_id, from_enum.value, to_enum.value, worker_id, effective_call_id, now),
                     )
                     return True
                 return False
@@ -527,6 +541,13 @@ class CallRepo:
                 if cur.rowcount == 0:
                     return False
 
+                # Ensure agent records binding to this call
+                if agent_id is not None:
+                    self.conn.execute(
+                        "UPDATE agents SET reserved_call_id = ? WHERE id = ?;",
+                        (call_id, agent_id),
+                    )
+
                 # Record initial event
                 self.conn.execute(
                     """
@@ -586,7 +607,12 @@ class CallRepo:
 
         def _op() -> ApplyResult:
             with transaction(self.conn):
-                # 1. Event recording and deduplication
+                # 1. Load the call first (unknown -> UNKNOWN_CALL, leaves no call_events row)
+                call = self.get_call(call_id)
+                if call is None:
+                    return ApplyResult.UNKNOWN_CALL
+
+                # 2. Event recording and deduplication
                 event_row_id = None
                 if provider_event_id is not None:
                     cur = self.conn.execute(
@@ -610,11 +636,6 @@ class CallRepo:
                         (call_id, target_state.value, ts),
                     )
                     event_row_id = cur.lastrowid
-
-                # 2. Load the call
-                call = self.get_call(call_id)
-                if call is None:
-                    return ApplyResult.UNKNOWN_CALL
 
                 curr_state = CallState(call["state"])
                 curr_rank = call["state_rank"]
@@ -648,7 +669,7 @@ class CallRepo:
                         (event_row_id,),
                     )
 
-                # 4. Atomic side effects on agent and borrower
+                # 4. Atomic side effects on agent and borrower (guarded by expect_call_id=call_id)
                 agent_id = call["agent_id"]
                 borrower_id = call["borrower_id"]
                 agent_repo = AgentRepo(self.conn, self.config)
@@ -656,44 +677,82 @@ class CallRepo:
 
                 if target_state == CallState.INITIATED:
                     if agent_id:
-                        agent_repo.transition(agent_id, AgentState.RESERVED, AgentState.DIALING, call_id=call_id)
+                        agent_repo.transition(
+                            agent_id,
+                            AgentState.RESERVED,
+                            AgentState.DIALING,
+                            call_id=call_id,
+                            expect_call_id=call_id,
+                        )
 
                 elif target_state in (CallState.ANSWERED, CallState.CONNECTED):
                     if agent_id:
                         applied_agent = agent_repo.transition(
-                            agent_id, AgentState.DIALING, AgentState.CONNECTED, call_id=call_id
+                            agent_id,
+                            AgentState.DIALING,
+                            AgentState.CONNECTED,
+                            call_id=call_id,
+                            expect_call_id=call_id,
                         )
                         if not applied_agent:
                             # Forward jump: if agent still in RESERVED, transition RESERVED->DIALING then DIALING->CONNECTED
                             if agent_repo.transition(
-                                agent_id, AgentState.RESERVED, AgentState.DIALING, call_id=call_id
+                                agent_id,
+                                AgentState.RESERVED,
+                                AgentState.DIALING,
+                                call_id=call_id,
+                                expect_call_id=call_id,
                             ):
                                 agent_repo.transition(
-                                    agent_id, AgentState.DIALING, AgentState.CONNECTED, call_id=call_id
+                                    agent_id,
+                                    AgentState.DIALING,
+                                    AgentState.CONNECTED,
+                                    call_id=call_id,
+                                    expect_call_id=call_id,
                                 )
 
                 elif target_state == CallState.COMPLETED:
                     if agent_id:
                         applied_agent = agent_repo.transition(
-                            agent_id, AgentState.CONNECTED, AgentState.WRAP_UP, call_id=call_id
+                            agent_id,
+                            AgentState.CONNECTED,
+                            AgentState.WRAP_UP,
+                            call_id=call_id,
+                            expect_call_id=call_id,
                         )
                         if not applied_agent:
                             # Release idle agent if call completed before connecting
                             if not agent_repo.transition(
-                                agent_id, AgentState.DIALING, AgentState.AVAILABLE, call_id=call_id
+                                agent_id,
+                                AgentState.DIALING,
+                                AgentState.AVAILABLE,
+                                call_id=call_id,
+                                expect_call_id=call_id,
                             ):
                                 agent_repo.transition(
-                                    agent_id, AgentState.RESERVED, AgentState.AVAILABLE, call_id=call_id
+                                    agent_id,
+                                    AgentState.RESERVED,
+                                    AgentState.AVAILABLE,
+                                    call_id=call_id,
+                                    expect_call_id=call_id,
                                 )
                     borrower_repo.mark_done(borrower_id)
 
                 elif target_state in (CallState.FAILED, CallState.CANCELLED):
                     if agent_id:
                         if not agent_repo.transition(
-                            agent_id, AgentState.RESERVED, AgentState.AVAILABLE, call_id=call_id
+                            agent_id,
+                            AgentState.RESERVED,
+                            AgentState.AVAILABLE,
+                            call_id=call_id,
+                            expect_call_id=call_id,
                         ):
                             agent_repo.transition(
-                                agent_id, AgentState.DIALING, AgentState.AVAILABLE, call_id=call_id
+                                agent_id,
+                                AgentState.DIALING,
+                                AgentState.AVAILABLE,
+                                call_id=call_id,
+                                expect_call_id=call_id,
                             )
                     borrower_repo.record_failure(borrower_id, now=ts)
 
