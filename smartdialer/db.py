@@ -112,6 +112,55 @@ def init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_borrowers_state_next_attempt
         ON borrowers(state, next_attempt_at);
         """,
+        """
+        CREATE TABLE IF NOT EXISTS safety_state (
+            campaign_id TEXT PRIMARY KEY,
+            fallback_until REAL NOT NULL DEFAULT 0,
+            reason TEXT,
+            updated_at REAL NOT NULL
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS safety_allotments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id TEXT NOT NULL,
+            mode TEXT NOT NULL CHECK(mode IN ('PROGRESSIVE','PREDICTIVE')),
+            approved INTEGER NOT NULL,
+            remaining INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS safety_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id TEXT NOT NULL,
+            at REAL NOT NULL,
+            mode TEXT NOT NULL,
+            requested INTEGER,
+            approved INTEGER NOT NULL,
+            verdict TEXT NOT NULL,
+            cancel_excess INTEGER NOT NULL DEFAULT 0,
+            reasons TEXT NOT NULL,
+            inputs TEXT NOT NULL
+        );
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_calls_state_agent
+        ON calls(state, agent_id);
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_calls_created_at
+        ON calls(created_at);
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_safety_allotments_campaign_expires
+        ON safety_allotments(campaign_id, expires_at);
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_safety_decisions_at
+        ON safety_decisions(at);
+        """,
     ]
 
     # Run inside an explicit immediate transaction

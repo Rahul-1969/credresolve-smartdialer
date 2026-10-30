@@ -274,3 +274,34 @@ def test_outage_modes_and_event_handling():
     # Ground truth still reports truth!
     truth = prov.get_call_status("call_dropped", now=150.0)
     assert truth in {"ANSWERED", "COMPLETED"}
+
+
+def test_cancel_call_clears_scheduled_truth():
+    """Cancel accepted clears scheduled truth: get_call_status returns RINGING/INITIATED until cancelled_at, then CANCELLED."""
+    rng = random.Random(707)
+    behavior = BorrowerBehavior(answer_rate=1.0, mean_talk_s=30.0)
+    profile = ProviderProfile(
+        setup_latency_s=1.0,
+        latency_jitter_s=0.0,
+        error_rate=0.0,
+        timeout_rate=0.0,
+    )
+    prov = MockProvider("prov_cancel_fix", profile, behavior, rng)
+    prov.place_call("c_cancel_truth", "+7001", now=0.0)
+
+    # Initial state at 0.5 is INITIATED
+    assert prov.get_call_status("c_cancel_truth", now=0.5) == "INITIATED"
+    # At 1.5 it is RINGING
+    assert prov.get_call_status("c_cancel_truth", now=1.5) == "RINGING"
+
+    # Cancel at 1.5s (before borrower answers)
+    cancelled = prov.cancel_call("c_cancel_truth", now=1.5)
+    assert cancelled is True
+
+    # With setup_latency_s=1.0, cancelled_at = 1.5 + 1.0 = 2.5s
+    # Before cancelled_at (e.g. 2.0s): status is RINGING (never ANSWERED or COMPLETED)
+    assert prov.get_call_status("c_cancel_truth", now=2.0) == "RINGING"
+
+    # At and after cancelled_at (e.g. 2.5s, 50.0s): status is CANCELLED
+    assert prov.get_call_status("c_cancel_truth", now=2.5) == "CANCELLED"
+    assert prov.get_call_status("c_cancel_truth", now=50.0) == "CANCELLED"

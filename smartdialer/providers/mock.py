@@ -250,6 +250,11 @@ class MockProvider(TelecomProvider):
             if not (item.event.call_id == call_id and item.event.occurred_at > now)
         ]
 
+        # Clear scheduled truth so get_call_status never returns ANSWERED/COMPLETED/FAILED afterwards
+        record.answered_at = None
+        record.completed_at = None
+        record.failed_at = None
+
         # Emit CANCELLED at now + latency
         jitter = self.rng.uniform(-self.profile.latency_jitter_s, self.profile.latency_jitter_s)
         latency = max(0.01, self.profile.setup_latency_s + jitter)
