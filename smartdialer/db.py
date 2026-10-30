@@ -86,6 +86,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
             state_rank INTEGER NOT NULL DEFAULT 0,
             version INTEGER NOT NULL DEFAULT 0,
             attempt INTEGER NOT NULL DEFAULT 1,
+            answered_at REAL,
+            end_reason TEXT,
+            abandoned INTEGER NOT NULL DEFAULT 0,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         );

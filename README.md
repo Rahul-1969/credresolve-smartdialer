@@ -12,6 +12,8 @@ In-memory caches are explicitly avoided because local caches can become stale du
 
 ## Setup
 
+Note: Schema migrations are not automated in development; delete existing `.db` files before running new schema versions.
+
 Run the following commands in Windows PowerShell:
 
 ```powershell

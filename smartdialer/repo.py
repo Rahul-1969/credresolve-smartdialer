@@ -544,8 +544,12 @@ class CallRepo:
                 # Ensure agent records binding to this call
                 if agent_id is not None:
                     self.conn.execute(
-                        "UPDATE agents SET reserved_call_id = ? WHERE id = ?;",
-                        (call_id, agent_id),
+                        """
+                        UPDATE agents
+                        SET reserved_call_id = ?
+                        WHERE id = ? AND state = 'RESERVED' AND (reserved_call_id IS NULL OR reserved_call_id = ?);
+                        """,
+                        (call_id, agent_id, call_id),
                     )
 
                 # Record initial event
@@ -599,6 +603,7 @@ class CallRepo:
         event_type: CallState | str,
         provider_event_id: str | None = None,
         now: float | None = None,
+        reason: str | None = None,
     ) -> ApplyResult:
         """Apply a provider event to a call idempotently, executing state side effects in the same txn."""
         ts = self.config.clock() if now is None else now
@@ -667,6 +672,20 @@ class CallRepo:
                     self.conn.execute(
                         "UPDATE call_events SET applied = 1 WHERE id = ?;",
                         (event_row_id,),
+                    )
+
+                # Update answered_at and end_reason when transition is applied
+                if target_state in (CallState.ANSWERED, CallState.CONNECTED, CallState.COMPLETED):
+                    self.conn.execute(
+                        "UPDATE calls SET answered_at = COALESCE(answered_at, ?) WHERE id = ?;",
+                        (ts, call_id),
+                    )
+
+                if target_state in TERMINAL:
+                    resolved_reason = reason if reason is not None else target_state.value
+                    self.conn.execute(
+                        "UPDATE calls SET end_reason = COALESCE(end_reason, ?) WHERE id = ?;",
+                        (resolved_reason, call_id),
                     )
 
                 # 4. Atomic side effects on agent and borrower (guarded by expect_call_id=call_id)
