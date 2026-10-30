@@ -37,6 +37,7 @@ class SystemSnapshot:
     online: int  # All agents except OFFLINE and PAUSED
     unbound_in_flight: int
     ringing_unbound: int
+    unanswered_unbound: int
     bound_in_flight: int
     answered_waiting: int
     pending_progressive: int

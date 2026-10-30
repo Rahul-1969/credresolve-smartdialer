@@ -37,6 +37,8 @@ from smartdialer.calls import RANK, TERMINAL, ApplyResult
 from smartdialer.config import Config
 from smartdialer.models import AgentState, BorrowerState, CallState
 
+NON_PENALIZED: set[str] = {"PROVIDER_ERROR", "CANCELLED", "AGENT_LOST"}
+
 T = TypeVar("T")
 
 
@@ -494,6 +496,34 @@ class BorrowerRepo:
 
         return with_retry(_op, self.conn)
 
+    def release_to_queued(
+        self,
+        borrower_id: str,
+        next_attempt_at: float,
+        now: float | None = None,
+    ) -> bool:
+        """Release a borrower back to QUEUED with unchanged attempts."""
+        ts = self.config.clock() if now is None else now
+
+        def _op() -> bool:
+            with transaction(self.conn):
+                cur = self.conn.execute(
+                    """
+                    UPDATE borrowers
+                    SET state = 'QUEUED',
+                        claimed_by = NULL,
+                        lease_expires_at = NULL,
+                        next_attempt_at = ?,
+                        version = version + 1,
+                        updated_at = ?
+                    WHERE id = ?;
+                    """,
+                    (next_attempt_at, ts, borrower_id),
+                )
+                return cur.rowcount == 1
+
+        return with_retry(_op, self.conn)
+
     def get_borrower(self, borrower_id: str) -> dict[str, Any] | None:
         """Retrieve borrower record as a dictionary or None if not found."""
         cur = self.conn.execute("SELECT * FROM borrowers WHERE id = ?;", (borrower_id,))
@@ -705,7 +735,43 @@ class CallRepo:
                         )
 
                 elif target_state in (CallState.ANSWERED, CallState.CONNECTED):
-                    if agent_id:
+                    if agent_id is None and call["abandoned"] == 0:
+                        # Unbound call: try bind-on-answer
+                        reserved = agent_repo.reserve_agents("binder", 1, call_ids=[call_id])
+                        if reserved:
+                            bound_agent_id = reserved[0]
+                            agent_id = bound_agent_id
+                            self.conn.execute(
+                                "UPDATE calls SET agent_id = ?, updated_at = ? WHERE id = ?;",
+                                (bound_agent_id, ts, call_id),
+                            )
+                            agent_repo.transition(
+                                bound_agent_id,
+                                AgentState.RESERVED,
+                                AgentState.DIALING,
+                                call_id=call_id,
+                                expect_call_id=call_id,
+                            )
+                            agent_repo.transition(
+                                bound_agent_id,
+                                AgentState.DIALING,
+                                AgentState.CONNECTED,
+                                call_id=call_id,
+                                expect_call_id=call_id,
+                            )
+                        else:
+                            self.conn.execute(
+                                "UPDATE calls SET abandoned = 1, updated_at = ? WHERE id = ?;",
+                                (ts, call_id),
+                            )
+                            self.conn.execute(
+                                """
+                                INSERT OR IGNORE INTO call_actions (call_id, action, reason, created_at)
+                                VALUES (?, 'TERMINATE', 'ABANDONED', ?);
+                                """,
+                                (call_id, ts),
+                            )
+                    elif agent_id:
                         applied_agent = agent_repo.transition(
                             agent_id,
                             AgentState.DIALING,
@@ -731,31 +797,50 @@ class CallRepo:
                                 )
 
                 elif target_state == CallState.COMPLETED:
-                    if agent_id:
-                        applied_agent = agent_repo.transition(
-                            agent_id,
-                            AgentState.CONNECTED,
-                            AgentState.WRAP_UP,
-                            call_id=call_id,
-                            expect_call_id=call_id,
+                    is_abandoned = (call["abandoned"] == 1)
+                    if agent_id is None:
+                        is_abandoned = True
+                        self.conn.execute(
+                            "UPDATE calls SET abandoned = 1, updated_at = ? WHERE id = ?;",
+                            (ts, call_id),
                         )
-                        if not applied_agent:
-                            # Release idle agent if call completed before connecting
-                            if not agent_repo.transition(
+
+                    if is_abandoned:
+                        self.conn.execute(
+                            "UPDATE calls SET end_reason = 'ABANDONED', updated_at = ? WHERE id = ?;",
+                            (ts, call_id),
+                        )
+                        borrower_repo.release_to_queued(
+                            borrower_id,
+                            next_attempt_at=ts + self.config.abandon_retry_delay_s,
+                            now=ts,
+                        )
+                    else:
+                        if agent_id:
+                            applied_agent = agent_repo.transition(
                                 agent_id,
-                                AgentState.DIALING,
-                                AgentState.AVAILABLE,
+                                AgentState.CONNECTED,
+                                AgentState.WRAP_UP,
                                 call_id=call_id,
                                 expect_call_id=call_id,
-                            ):
-                                agent_repo.transition(
+                            )
+                            if not applied_agent:
+                                # Release idle agent if call completed before connecting
+                                if not agent_repo.transition(
                                     agent_id,
-                                    AgentState.RESERVED,
+                                    AgentState.DIALING,
                                     AgentState.AVAILABLE,
                                     call_id=call_id,
                                     expect_call_id=call_id,
-                                )
-                    borrower_repo.mark_done(borrower_id)
+                                ):
+                                    agent_repo.transition(
+                                        agent_id,
+                                        AgentState.RESERVED,
+                                        AgentState.AVAILABLE,
+                                        call_id=call_id,
+                                        expect_call_id=call_id,
+                                    )
+                        borrower_repo.mark_done(borrower_id)
 
                 elif target_state in (CallState.FAILED, CallState.CANCELLED):
                     if agent_id:
@@ -773,7 +858,15 @@ class CallRepo:
                                 call_id=call_id,
                                 expect_call_id=call_id,
                             )
-                    borrower_repo.record_failure(borrower_id, now=ts)
+                    resolved_reason = reason if reason is not None else target_state.value
+                    if resolved_reason in NON_PENALIZED:
+                        borrower_repo.release_to_queued(
+                            borrower_id,
+                            next_attempt_at=ts + self.config.nonpenalized_retry_delay_s,
+                            now=ts,
+                        )
+                    else:
+                        borrower_repo.record_failure(borrower_id, now=ts)
 
                 return ApplyResult.APPLIED
 

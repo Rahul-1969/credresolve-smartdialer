@@ -146,6 +146,24 @@ def init_schema(conn: sqlite3.Connection) -> None:
         );
         """,
         """
+        CREATE TABLE IF NOT EXISTS call_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            call_id TEXT NOT NULL,
+            action TEXT NOT NULL CHECK(action IN ('CANCEL','TERMINATE')),
+            reason TEXT,
+            created_at REAL NOT NULL,
+            claimed_by TEXT,
+            claim_expires_at REAL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            done_at REAL,
+            UNIQUE(call_id, action)
+        );
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_call_actions_claim
+        ON call_actions(done_at, attempts, claimed_by, claim_expires_at);
+        """,
+        """
         CREATE INDEX IF NOT EXISTS idx_calls_state_agent
         ON calls(state, agent_id);
         """,

@@ -5,9 +5,10 @@ Single Responsibility:
     agent availability, active calls, response rate windows, and abandonment rates.
 
 Metric Definitions:
-    - unbound_in_flight: Calls with agent_id IS NULL and state in (INITIATED, RINGING).
+    - unbound_in_flight: Calls with agent_id IS NULL and state in (RESERVED, INITIATED, RINGING).
     - ringing_unbound: The RINGING subset of unbound_in_flight calls.
-    - bound_in_flight: Calls with agent_id NOT NULL and state in (INITIATED, RINGING).
+    - unanswered_unbound: Calls with agent_id IS NULL and state in (RESERVED, INITIATED, RINGING).
+    - bound_in_flight: Calls with agent_id NOT NULL and state in (RESERVED, INITIATED, RINGING).
     - answered_waiting: Calls with agent_id IS NULL, state in (ANSWERED, CONNECTED) and abandoned = 0.
     - pending_*: SUM(remaining) over safety_allotments with expires_at > now, grouped by mode.
     - RateStats (window w): Among calls with created_at >= now - w and state_rank >= 2:
@@ -54,9 +55,10 @@ def read_snapshot(
     cur_calls = conn.execute(
         """
         SELECT
-            SUM(CASE WHEN agent_id IS NULL AND state IN ('INITIATED', 'RINGING') THEN 1 ELSE 0 END) AS unbound_in_flight,
+            SUM(CASE WHEN agent_id IS NULL AND state IN ('RESERVED', 'INITIATED', 'RINGING') THEN 1 ELSE 0 END) AS unbound_in_flight,
             SUM(CASE WHEN agent_id IS NULL AND state = 'RINGING' THEN 1 ELSE 0 END) AS ringing_unbound,
-            SUM(CASE WHEN agent_id IS NOT NULL AND state IN ('INITIATED', 'RINGING') THEN 1 ELSE 0 END) AS bound_in_flight,
+            SUM(CASE WHEN agent_id IS NULL AND state IN ('RESERVED', 'INITIATED', 'RINGING') THEN 1 ELSE 0 END) AS unanswered_unbound,
+            SUM(CASE WHEN agent_id IS NOT NULL AND state IN ('RESERVED', 'INITIATED', 'RINGING') THEN 1 ELSE 0 END) AS bound_in_flight,
             SUM(CASE WHEN agent_id IS NULL AND state IN ('ANSWERED', 'CONNECTED') AND abandoned = 0 THEN 1 ELSE 0 END) AS answered_waiting
         FROM calls;
         """
@@ -64,6 +66,7 @@ def read_snapshot(
     call_row = cur_calls.fetchone()
     unbound_in_flight = call_row["unbound_in_flight"] or 0
     ringing_unbound = call_row["ringing_unbound"] or 0
+    unanswered_unbound = call_row["unanswered_unbound"] or 0
     bound_in_flight = call_row["bound_in_flight"] or 0
     answered_waiting = call_row["answered_waiting"] or 0
 
@@ -145,6 +148,7 @@ def read_snapshot(
         online=online,
         unbound_in_flight=unbound_in_flight,
         ringing_unbound=ringing_unbound,
+        unanswered_unbound=unanswered_unbound,
         bound_in_flight=bound_in_flight,
         answered_waiting=answered_waiting,
         pending_progressive=pending_progressive,

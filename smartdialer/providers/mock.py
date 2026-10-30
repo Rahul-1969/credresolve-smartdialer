@@ -281,6 +281,63 @@ class MockProvider(TelecomProvider):
         )
         return True
 
+    def terminate_call(self, call_id: str, now: float) -> bool:
+        """Terminate an active ANSWERED call.
+
+        Drop the pending COMPLETED event, schedule a new COMPLETED at now + latency,
+        update ground truth (completed_at), and return True.
+        Returns False if call is unknown or not currently ANSWERED.
+        Outage rules apply (raise ProviderError / ProviderTimeout like place_call).
+        """
+        # Active outage check
+        outage = self._get_active_outage(now)
+        if outage is not None:
+            if outage.mode == "error":
+                raise ProviderError(f"Provider {self.name} active outage: error")
+            if outage.mode == "timeout":
+                raise ProviderTimeout(f"Provider {self.name} active outage: timeout")
+
+        if call_id not in self._call_records:
+            return False
+
+        status = self.get_call_status(call_id, now)
+        if status != "ANSWERED":
+            return False
+
+        record = self._call_records[call_id]
+
+        # Drop not-yet-occurred COMPLETED events for this call
+        self._pending_events = [
+            item
+            for item in self._pending_events
+            if not (item.event.call_id == call_id and item.event.event_type == "COMPLETED")
+        ]
+
+        jitter = self.rng.uniform(-self.profile.latency_jitter_s, self.profile.latency_jitter_s)
+        latency = max(0.01, self.profile.setup_latency_s + jitter)
+        completed_at = now + latency
+        record.completed_at = completed_at
+
+        provider_call_id = self._placed_calls[call_id].provider_call_id
+        term_evt = ProviderEvent(
+            provider=self.name,
+            call_id=call_id,
+            provider_call_id=provider_call_id,
+            provider_event_id=f"{self.name}:{call_id}:COMPLETED",
+            event_type="COMPLETED",
+            reason="TERMINATED",
+            occurred_at=completed_at,
+            deliver_at=completed_at,
+        )
+        self._pending_events.append(
+            _PendingEventItem(
+                deliver_at=completed_at,
+                seq=self._next_seq(),
+                event=term_evt,
+            )
+        )
+        return True
+
     def poll_events(self, now: float) -> list[ProviderEvent]:
         """Poll events with deliver_at <= now, respecting outage delays/drops."""
         remaining: list[_PendingEventItem] = []

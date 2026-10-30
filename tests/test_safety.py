@@ -447,8 +447,8 @@ def test_9_provider_health_rejection_and_capping(test_env):
     assert "PROVIDER_HALF_OPEN_CAP" in dec_half.reasons
 
 
-def test_10_agent_drop_recommends_cancellation_and_resumes(test_env):
-    """10. 100 available agents, 70 unbound in flight; 60 go OFFLINE -> REJECTED with AGENT_DROP, cancel_excess."""
+def test_10_capacity_excess_recommends_cancellation_and_resumes(test_env):
+    """10. 100 available agents, 70 unbound in flight; 60 go OFFLINE -> REJECTED with CAPACITY_EXCESS, cancel_excess."""
     conn, controller, _ = test_env
     seed_agents(conn, {AgentState.AVAILABLE: 100})
     seed_call_history(conn, 30, 45, created_at=950.0)  # p ~ 0.4
@@ -469,7 +469,7 @@ def test_10_agent_drop_recommends_cancellation_and_resumes(test_env):
     dec = controller.evaluate(conn, PacingRequest(PacingMode.PREDICTIVE, 50, {}), now=1000.0)
     assert dec.approved == 0
     assert dec.verdict == "REJECTED"
-    assert "AGENT_DROP" in dec.reasons
+    assert "CAPACITY_EXCESS" in dec.reasons
     assert dec.cancel_excess > 0
 
     # Verify cancel_excess matches independently computed excess (<= ringing_unbound)
@@ -580,3 +580,73 @@ def test_14_progressive_mode_invariants(test_env):
     assert dec.approved <= 25
     assert dec.inputs["credit"] == 0
     assert dec.inputs["mode"] == "PROGRESSIVE"
+
+
+def test_predictive_reserved_call_counted_in_n0(test_env):
+    """Predictive call in state RESERVED with agent_id IS NULL is counted in N0."""
+    conn, controller, _ = test_env
+    seed_agents(conn, {AgentState.AVAILABLE: 20})
+    seed_call_history(conn, 30, 30, created_at=950.0)
+
+    # Seed 5 unbound calls in state RESERVED
+    for i in range(5):
+        conn.execute(
+            """
+            INSERT INTO calls (id, borrower_id, agent_id, state, state_rank, attempt, created_at, updated_at)
+            VALUES (?, 'b_dummy', NULL, 'RESERVED', 1, 1, 990.0, 990.0);
+            """,
+            (f"call_res_{i}",),
+        )
+
+    dec = controller.evaluate(conn, PacingRequest(PacingMode.PREDICTIVE, 50, {}), now=1000.0)
+    assert dec.inputs["N0"] == 5
+
+
+def test_independent_k1_k2_computation(test_env):
+    """Independently recompute k1 and k2 using binom_tail_gt directly and assert they equal decision.inputs."""
+    conn, controller, _ = test_env
+
+    scenarios = [
+        # (available, wrap_up, in_flight, p_ans, p_noans, req)
+        (20, 6, 4, 30, 30, 50),
+        (50, 10, 15, 40, 20, 100),
+        (35, 8, 0, 20, 40, 80),
+        (15, 2, 5, 50, 10, 40),
+    ]
+
+    for A, wrap_up, in_flight, n_ans, n_noans, req in scenarios:
+        # Clear tables
+        conn.execute("DELETE FROM agents;")
+        conn.execute("DELETE FROM calls;")
+        conn.execute("DELETE FROM safety_allotments;")
+        conn.execute("DELETE FROM safety_decisions;")
+
+        seed_agents(conn, {AgentState.AVAILABLE: A, AgentState.WRAP_UP: wrap_up})
+        seed_call_history(conn, n_ans, n_noans, created_at=950.0)
+
+        for i in range(in_flight):
+            conn.execute(
+                """
+                INSERT INTO calls (id, borrower_id, agent_id, state, state_rank, attempt, created_at, updated_at)
+                VALUES (?, 'b_dummy', NULL, 'RINGING', 3, 1, 990.0, 990.0);
+                """,
+                (f"call_if_{i}",),
+            )
+
+        dec = controller.evaluate(conn, PacingRequest(PacingMode.PREDICTIVE, req, {}), now=1000.0)
+
+        # Independent calculation
+        credit = math.floor(controller.config.wrap_up_credit * wrap_up)
+        cap = max(0, A + credit)  # D = 0
+        N0 = in_flight
+
+        p_short = wilson_upper(n_ans, n_ans + n_noans, controller.config.z)
+        p_hi = p_short  # both short and long have same data
+
+        expected_k1 = math.floor(cap * controller.config.max_overdial_ratio) - N0
+        search_limit = math.floor(cap * 2.0) + 1
+        expected_n_risk = max_total_calls_within_risk(cap, p_hi, controller.config.risk_limit, search_limit)
+        expected_k2 = expected_n_risk - N0
+
+        assert dec.inputs["k1"] == expected_k1
+        assert dec.inputs["k2"] == expected_k2

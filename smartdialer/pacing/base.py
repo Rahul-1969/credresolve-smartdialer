@@ -1,7 +1,7 @@
 """Base definitions and message contracts for pacing engines.
 
 Single Responsibility:
-    Define pacing modes and the immutable request contract emitted by pacing algorithms.
+    Define pacing modes, request contracts, and the PacingEngine protocol.
 
 Architecture Contract:
     A PacingRequest is the ONLY thing a pacing engine may output.
@@ -11,7 +11,9 @@ Architecture Contract:
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
+
+from smartdialer.snapshot import SystemSnapshot
 
 
 class PacingMode(str, Enum):
@@ -31,3 +33,12 @@ class PacingRequest:
     mode: PacingMode
     requested_calls: int
     rationale: dict[str, Any]
+
+
+@runtime_checkable
+class PacingEngine(Protocol):
+    """Protocol for pacing engines that propose outbound dial counts based on system snapshot."""
+
+    def propose(self, snapshot: SystemSnapshot) -> PacingRequest:
+        """Propose an outbound dial batch proposal from the current snapshot."""
+        ...

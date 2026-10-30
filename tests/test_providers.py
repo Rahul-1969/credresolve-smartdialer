@@ -305,3 +305,71 @@ def test_cancel_call_clears_scheduled_truth():
     # At and after cancelled_at (e.g. 2.5s, 50.0s): status is CANCELLED
     assert prov.get_call_status("c_cancel_truth", now=2.5) == "CANCELLED"
     assert prov.get_call_status("c_cancel_truth", now=50.0) == "CANCELLED"
+
+
+def test_terminate_call_behavior():
+    """terminate_call ends an ANSWERED call, updates truth, and emits COMPLETED."""
+    rng = random.Random(808)
+    behavior = BorrowerBehavior(answer_rate=1.0, mean_talk_s=60.0)
+    profile = ProviderProfile(
+        setup_latency_s=0.5,
+        latency_jitter_s=0.0,
+        error_rate=0.0,
+        timeout_rate=0.0,
+    )
+    prov = MockProvider("prov_term_test", profile, behavior, rng)
+    prov.place_call("c_term_1", "+8001", now=0.0)
+
+    # Unknown call returns False
+    assert prov.terminate_call("unknown_call", now=2.0) is False
+
+    # At 0.2s: INITIATED -> terminate returns False
+    assert prov.terminate_call("c_term_1", now=0.2) is False
+
+    # After ringing finishes (max 8.5s), call is ANSWERED at 10.0s
+    status_at_10 = prov.get_call_status("c_term_1", now=10.0)
+    assert status_at_10 == "ANSWERED"
+
+    # Terminate the ANSWERED call at now=10.0s
+    res = prov.terminate_call("c_term_1", now=10.0)
+    assert res is True
+
+    # COMPLETED scheduled at 10.0 + 0.5 = 10.5s
+    assert prov.get_call_status("c_term_1", now=10.2) == "ANSWERED"
+    assert prov.get_call_status("c_term_1", now=10.5) == "COMPLETED"
+
+    # Polling events delivers the TERMINATED COMPLETED event
+    evts = prov.poll_events(now=12.0)
+    term_evts = [e for e in evts if e.call_id == "c_term_1" and e.event_type == "COMPLETED"]
+    assert len(term_evts) == 1
+    assert term_evts[0].reason == "TERMINATED"
+
+    # Terminating already COMPLETED call returns False
+    assert prov.terminate_call("c_term_1", now=15.0) is False
+
+
+def test_terminate_call_outage_handling():
+    """terminate_call obeys active outage policies (error/timeout)."""
+    rng = random.Random(909)
+    behavior = BorrowerBehavior(answer_rate=1.0, mean_talk_s=60.0)
+    profile = ProviderProfile(
+        setup_latency_s=0.1,
+        latency_jitter_s=0.0,
+        error_rate=0.0,
+        timeout_rate=0.0,
+    )
+    prov = MockProvider("prov_term_outage", profile, behavior, rng)
+    prov.place_call("c_term_out", "+9001", now=0.0)
+
+    # Fast forward until ANSWERED (at 10.0s)
+    assert prov.get_call_status("c_term_out", now=10.0) == "ANSWERED"
+
+    # Inject error outage [10.0, 20.0)
+    prov.inject_outage(start=10.0, end=20.0, mode="error", events="drop")
+    with pytest.raises(ProviderError):
+        prov.terminate_call("c_term_out", now=15.0)
+
+    # Inject timeout outage [20.0, 30.0)
+    prov.inject_outage(start=20.0, end=30.0, mode="timeout", events="drop")
+    with pytest.raises(ProviderTimeout):
+        prov.terminate_call("c_term_out", now=25.0)

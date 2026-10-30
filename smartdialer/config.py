@@ -21,4 +21,8 @@ class Config:
     progressive_fallback_threshold: float = 0.05
     default_provider: str = "provider_a"
     log_level: str = "INFO"
+    abandon_retry_delay_s: float = 300.0
+    nonpenalized_retry_delay_s: float = 5.0
+    action_claim_lease_s: float = 15.0
+    action_max_attempts: int = 10
     clock: Callable[[], float] = field(default=time.time)

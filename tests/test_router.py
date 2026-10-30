@@ -40,6 +40,9 @@ class DummyProvider(TelecomProvider):
     def cancel_call(self, call_id: str, now: float) -> bool:
         return True
 
+    def terminate_call(self, call_id: str, now: float) -> bool:
+        return True
+
     def poll_events(self, now: float) -> list[ProviderEvent]:
         return []
 

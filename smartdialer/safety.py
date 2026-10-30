@@ -453,7 +453,7 @@ class SafetyController:
                     if "MAX_BATCH" not in reasons_list:
                         reasons_list.append("MAX_BATCH")
 
-                # 7. Agent-drop guard
+                # 7. Capacity excess guard
                 allowed_total = min(
                     math.floor(cap * self.config.max_overdial_ratio),
                     N_risk,
@@ -464,9 +464,9 @@ class SafetyController:
                 if excess > 0:
                     approved = 0
                     verdict = "REJECTED"
-                    reasons_list = ["AGENT_DROP"]
-                    cancel_excess = min(excess, snapshot.ringing_unbound)
-                    binding = "AGENT_DROP"
+                    reasons_list = ["CAPACITY_EXCESS"]
+                    cancel_excess = min(excess, snapshot.unanswered_unbound)
+                    binding = "CAPACITY_EXCESS"
                 else:
                     approved = k
                     # 8. Verdict

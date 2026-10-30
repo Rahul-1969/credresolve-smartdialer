@@ -59,6 +59,13 @@ class TelecomProvider(ABC):
         """
 
     @abstractmethod
+    def terminate_call(self, call_id: str, now: float) -> bool:
+        """Terminate an active call.
+
+        Ends an ANSWERED (not yet completed) call; returns True if terminated.
+        """
+
+    @abstractmethod
     def poll_events(self, now: float) -> list[ProviderEvent]:
         """Poll delivered events with deliver_at <= now, ordered by (deliver_at, seq)."""
 

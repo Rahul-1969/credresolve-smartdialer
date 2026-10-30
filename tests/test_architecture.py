@@ -41,31 +41,65 @@ def get_imports_from_ast(tree: ast.AST) -> list[str]:
     return imports
 
 
-def validate_pacing_imports(source: str, filename: str = "<string>") -> None:
-    """Validate that imports in a pacing module comply with architecture constraints."""
-    tree = ast.parse(source, filename=filename)
-    imports = get_imports_from_ast(tree)
+FORBIDDEN_PACING_NAMES = {
+    "importlib",
+    "__import__",
+    "exec",
+    "eval",
+    "compile",
+    "open",
+    "sys.modules",
+}
 
+
+def validate_pacing_ast(source: str, filename: str = "<string>") -> None:
+    """Validate imports, relative imports, and forbidden execution primitives in pacing modules."""
+    tree = ast.parse(source, filename=filename)
     stdlib_modules = set(sys.stdlib_module_names)
 
-    for mod in imports:
-        # Check against forbidden modules directly
-        for forbidden in FORBIDDEN_PACING_MODULES:
-            if mod == forbidden or mod.startswith(forbidden + "."):
-                raise AssertionError(f"Forbidden import '{mod}' found in {filename}")
+    for node in ast.walk(tree):
+        # 1. Check relative imports
+        if isinstance(node, ast.ImportFrom):
+            if node.level > 1:
+                raise AssertionError(
+                    f"Disallowed relative import escaping smartdialer.pacing (level {node.level}) in {filename}"
+                )
+            if node.level == 0 and node.module:
+                mod = node.module
+                for forbidden in FORBIDDEN_PACING_MODULES:
+                    if mod == forbidden or mod.startswith(forbidden + "."):
+                        raise AssertionError(f"Forbidden import '{mod}' found in {filename}")
+                if mod.startswith("smartdialer."):
+                    if not any(mod == a or mod.startswith(a + ".") for a in ALLOWED_SMARTDIALER_ROOTS):
+                        raise AssertionError(f"Disallowed internal import '{mod}' found in {filename}")
+                else:
+                    root = mod.split(".")[0]
+                    if root not in stdlib_modules:
+                        raise AssertionError(f"Non-stdlib external import '{mod}' found in {filename}")
 
-        # If it's a smartdialer import, must be in allowed roots
-        if mod.startswith("smartdialer."):
-            is_allowed = any(
-                mod == allowed or mod.startswith(allowed + ".")
-                for allowed in ALLOWED_SMARTDIALER_ROOTS
-            )
-            if not is_allowed:
-                raise AssertionError(f"Disallowed internal import '{mod}' found in {filename}")
-        else:
-            root = mod.split(".")[0]
-            if root not in stdlib_modules:
-                raise AssertionError(f"Non-stdlib external import '{mod}' found in {filename}")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                mod = alias.name
+                for forbidden in FORBIDDEN_PACING_MODULES:
+                    if mod == forbidden or mod.startswith(forbidden + "."):
+                        raise AssertionError(f"Forbidden import '{mod}' found in {filename}")
+                if mod.startswith("smartdialer."):
+                    if not any(mod == a or mod.startswith(a + ".") for a in ALLOWED_SMARTDIALER_ROOTS):
+                        raise AssertionError(f"Disallowed internal import '{mod}' found in {filename}")
+                else:
+                    root = mod.split(".")[0]
+                    if root not in stdlib_modules:
+                        raise AssertionError(f"Non-stdlib external import '{mod}' found in {filename}")
+
+        # 2. Check forbidden names (importlib, __import__, exec, eval, compile, open, sys.modules)
+        elif isinstance(node, ast.Name):
+            if node.id in {"importlib", "__import__", "exec", "eval", "compile", "open"}:
+                raise AssertionError(f"Forbidden pacing identifier '{node.id}' found in {filename}")
+        elif isinstance(node, ast.Attribute):
+            if node.attr in {"importlib", "__import__", "exec", "eval", "compile", "open"}:
+                raise AssertionError(f"Forbidden pacing attribute '{node.attr}' found in {filename}")
+            if node.attr == "modules" and isinstance(node.value, ast.Name) and node.value.id == "sys":
+                raise AssertionError(f"Forbidden pacing reference 'sys.modules' found in {filename}")
 
 
 def get_identifiers_from_ast(tree: ast.AST) -> set[str]:
