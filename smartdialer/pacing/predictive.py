@@ -68,6 +68,7 @@ class PredictivePacer:
 
         # 3. Forecast agents becoming free within horizon
         talk = snapshot.avg_talk_s if snapshot.avg_talk_s is not None else self.config.default_talk_s
+        talk = max(talk, 1.0)
         finish_talk = 1.0 - math.exp(-self.config.horizon_s / talk)
         finish_wrap = 1.0 - math.exp(-self.config.horizon_s / self.config.wrap_up_mean_s)
 

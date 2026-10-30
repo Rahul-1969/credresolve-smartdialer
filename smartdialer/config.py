@@ -25,4 +25,7 @@ class Config:
     nonpenalized_retry_delay_s: float = 5.0
     action_claim_lease_s: float = 15.0
     action_max_attempts: int = 10
+    reserve_timeout_s: float = 20.0
+    stuck_call_timeout_s: float = 90.0
+    abandon_stuck_timeout_s: float = 30.0
     clock: Callable[[], float] = field(default=time.time)

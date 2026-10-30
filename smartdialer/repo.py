@@ -37,7 +37,7 @@ from smartdialer.calls import RANK, TERMINAL, ApplyResult
 from smartdialer.config import Config
 from smartdialer.models import AgentState, BorrowerState, CallState
 
-NON_PENALIZED: set[str] = {"PROVIDER_ERROR", "CANCELLED", "AGENT_LOST"}
+NON_PENALIZED: set[str] = {"PROVIDER_ERROR", "CANCELLED", "AGENT_LOST", "RECONCILED"}
 
 T = TypeVar("T")
 
@@ -144,6 +144,7 @@ class AgentRepo:
         worker_id: str,
         n: int,
         call_ids: list[str] | None = None,
+        now: float | None = None,
     ) -> list[str]:
         """Atomically reserve up to n AVAILABLE agents, longest-idle first.
 
@@ -154,8 +155,8 @@ class AgentRepo:
         if n <= 0:
             return []
 
-        now = self.config.clock()
-        lease_expires = now + self.config.agent_reservation_lease_seconds
+        ts = self.config.clock() if now is None else now
+        lease_expires = ts + self.config.agent_reservation_lease_seconds
 
         def _op() -> list[str]:
             with transaction(self.conn):
@@ -176,7 +177,7 @@ class AgentRepo:
                     AND state = 'AVAILABLE'
                     RETURNING id;
                     """,
-                    (worker_id, lease_expires, now, n),
+                    (worker_id, lease_expires, ts, n),
                 )
                 reserved_ids = [row["id"] for row in cur.fetchall()]
 
@@ -193,7 +194,7 @@ class AgentRepo:
                         INSERT INTO agent_events (agent_id, from_state, to_state, worker_id, call_id, at)
                         VALUES (?, 'AVAILABLE', 'RESERVED', ?, ?, ?);
                         """,
-                        (agent_id, worker_id, call_id, now),
+                        (agent_id, worker_id, call_id, ts),
                     )
 
                 return reserved_ids
@@ -208,6 +209,7 @@ class AgentRepo:
         worker_id: str | None = None,
         call_id: str | None = None,
         expect_call_id: str | None = None,
+        now: float | None = None,
     ) -> bool:
         """Transition an agent from from_state to to_state.
 
@@ -223,14 +225,14 @@ class AgentRepo:
                 f"Transition from {from_enum.value} to {to_enum.value} is not allowed"
             )
 
-        now = self.config.clock()
+        ts = self.config.clock() if now is None else now
 
         set_clauses = ["state = ?", "version = version + 1", "updated_at = ?"]
-        params: list[Any] = [to_enum.value, now]
+        params: list[Any] = [to_enum.value, ts]
 
         if to_enum == AgentState.AVAILABLE:
             set_clauses.append("available_since = ?")
-            params.append(now)
+            params.append(ts)
         else:
             set_clauses.append("available_since = NULL")
 
@@ -244,7 +246,7 @@ class AgentRepo:
             set_clauses.append("reserved_call_id = ?")
             params.append(call_id)
             set_clauses.append("lease_expires_at = ?")
-            params.append(now + self.config.agent_reservation_lease_seconds)
+            params.append(ts + self.config.agent_reservation_lease_seconds)
         else:
             # DIALING, CONNECTED, WRAP_UP:
             # Keep reserved_call_id and reserved_by as is.
@@ -271,7 +273,7 @@ class AgentRepo:
                         INSERT INTO agent_events (agent_id, from_state, to_state, worker_id, call_id, at)
                         VALUES (?, ?, ?, ?, ?, ?);
                         """,
-                        (agent_id, from_enum.value, to_enum.value, worker_id, effective_call_id, now),
+                        (agent_id, from_enum.value, to_enum.value, worker_id, effective_call_id, ts),
                     )
                     return True
                 return False
@@ -333,7 +335,7 @@ class BorrowerRepo:
             next_attempt_at=next_attempt_at,
         )
 
-    def claim_borrowers(self, worker_id: str, n: int) -> list[str]:
+    def claim_borrowers(self, worker_id: str, n: int, now: float | None = None) -> list[str]:
         """Atomically claim up to n QUEUED borrowers eligible for dialing (next_attempt_at <= now).
 
         Guaranteed race-free via conditional UPDATE ... RETURNING with AND state='QUEUED'.
@@ -341,8 +343,8 @@ class BorrowerRepo:
         if n <= 0:
             return []
 
-        now = self.config.clock()
-        lease_expires = now + self.config.borrower_claim_lease_seconds
+        ts = self.config.clock() if now is None else now
+        lease_expires = ts + self.config.borrower_claim_lease_seconds
 
         def _op() -> list[str]:
             with transaction(self.conn):
@@ -363,7 +365,7 @@ class BorrowerRepo:
                     AND state = 'QUEUED'
                     RETURNING id;
                     """,
-                    (worker_id, lease_expires, now, now, n),
+                    (worker_id, lease_expires, ts, ts, n),
                 )
                 return [row["id"] for row in cur.fetchall()]
 
@@ -501,14 +503,20 @@ class BorrowerRepo:
         borrower_id: str,
         next_attempt_at: float,
         now: float | None = None,
+        expect_state: str | None = None,
     ) -> bool:
         """Release a borrower back to QUEUED with unchanged attempts."""
         ts = self.config.clock() if now is None else now
 
         def _op() -> bool:
             with transaction(self.conn):
+                clause = "id = ? AND state NOT IN ('DONE', 'FAILED_PERMANENT')"
+                params = [next_attempt_at, ts, borrower_id]
+                if expect_state is not None:
+                    clause += " AND state = ?"
+                    params.append(expect_state)
                 cur = self.conn.execute(
-                    """
+                    f"""
                     UPDATE borrowers
                     SET state = 'QUEUED',
                         claimed_by = NULL,
@@ -516,9 +524,9 @@ class BorrowerRepo:
                         next_attempt_at = ?,
                         version = version + 1,
                         updated_at = ?
-                    WHERE id = ?;
+                    WHERE {clause};
                     """,
-                    (next_attempt_at, ts, borrower_id),
+                    tuple(params),
                 )
                 return cur.rowcount == 1
 
@@ -607,6 +615,42 @@ class CallRepo:
                 return True
 
         return with_retry(_op, self.conn)
+
+    def _bind_or_abandon(self, call_id: str, ts: float, agent_repo: AgentRepo) -> None:
+        """Attempt to bind an available agent on answer, or mark call abandoned and enqueue TERMINATE."""
+        reserved = agent_repo.reserve_agents("binder", 1, call_ids=[call_id])
+        if reserved:
+            bound_agent_id = reserved[0]
+            self.conn.execute(
+                "UPDATE calls SET agent_id = ?, updated_at = ? WHERE id = ?;",
+                (bound_agent_id, ts, call_id),
+            )
+            agent_repo.transition(
+                bound_agent_id,
+                AgentState.RESERVED,
+                AgentState.DIALING,
+                call_id=call_id,
+                expect_call_id=call_id,
+            )
+            agent_repo.transition(
+                bound_agent_id,
+                AgentState.DIALING,
+                AgentState.CONNECTED,
+                call_id=call_id,
+                expect_call_id=call_id,
+            )
+        else:
+            self.conn.execute(
+                "UPDATE calls SET abandoned = 1, updated_at = ? WHERE id = ?;",
+                (ts, call_id),
+            )
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO call_actions (call_id, action, reason, created_at)
+                VALUES (?, 'TERMINATE', 'ABANDONED', ?);
+                """,
+                (call_id, ts),
+            )
 
     def mark_initiated(
         self,
@@ -732,45 +776,13 @@ class CallRepo:
                             AgentState.DIALING,
                             call_id=call_id,
                             expect_call_id=call_id,
+                            now=ts,
                         )
 
                 elif target_state in (CallState.ANSWERED, CallState.CONNECTED):
                     if agent_id is None and call["abandoned"] == 0:
                         # Unbound call: try bind-on-answer
-                        reserved = agent_repo.reserve_agents("binder", 1, call_ids=[call_id])
-                        if reserved:
-                            bound_agent_id = reserved[0]
-                            agent_id = bound_agent_id
-                            self.conn.execute(
-                                "UPDATE calls SET agent_id = ?, updated_at = ? WHERE id = ?;",
-                                (bound_agent_id, ts, call_id),
-                            )
-                            agent_repo.transition(
-                                bound_agent_id,
-                                AgentState.RESERVED,
-                                AgentState.DIALING,
-                                call_id=call_id,
-                                expect_call_id=call_id,
-                            )
-                            agent_repo.transition(
-                                bound_agent_id,
-                                AgentState.DIALING,
-                                AgentState.CONNECTED,
-                                call_id=call_id,
-                                expect_call_id=call_id,
-                            )
-                        else:
-                            self.conn.execute(
-                                "UPDATE calls SET abandoned = 1, updated_at = ? WHERE id = ?;",
-                                (ts, call_id),
-                            )
-                            self.conn.execute(
-                                """
-                                INSERT OR IGNORE INTO call_actions (call_id, action, reason, created_at)
-                                VALUES (?, 'TERMINATE', 'ABANDONED', ?);
-                                """,
-                                (call_id, ts),
-                            )
+                        self._bind_or_abandon(call_id, ts, agent_repo)
                     elif agent_id:
                         applied_agent = agent_repo.transition(
                             agent_id,
@@ -778,6 +790,7 @@ class CallRepo:
                             AgentState.CONNECTED,
                             call_id=call_id,
                             expect_call_id=call_id,
+                            now=ts,
                         )
                         if not applied_agent:
                             # Forward jump: if agent still in RESERVED, transition RESERVED->DIALING then DIALING->CONNECTED
@@ -787,14 +800,34 @@ class CallRepo:
                                 AgentState.DIALING,
                                 call_id=call_id,
                                 expect_call_id=call_id,
+                                now=ts,
                             ):
-                                agent_repo.transition(
+                                applied_agent = agent_repo.transition(
                                     agent_id,
                                     AgentState.DIALING,
                                     AgentState.CONNECTED,
                                     call_id=call_id,
                                     expect_call_id=call_id,
+                                    now=ts,
                                 )
+
+                        # Part 2.2: if none applied and agent is no longer bound to this call
+                        cur_a = self.conn.execute(
+                            "SELECT state, reserved_call_id FROM agents WHERE id = ?;",
+                            (agent_id,),
+                        )
+                        a_row = cur_a.fetchone()
+                        agent_still_bound = (
+                            a_row is not None
+                            and a_row["reserved_call_id"] == call_id
+                            and a_row["state"] in ("RESERVED", "DIALING", "CONNECTED")
+                        )
+                        if not applied_agent and not agent_still_bound:
+                            self.conn.execute(
+                                "UPDATE calls SET agent_id = NULL, updated_at = ? WHERE id = ?;",
+                                (ts, call_id),
+                            )
+                            self._bind_or_abandon(call_id, ts, agent_repo)
 
                 elif target_state == CallState.COMPLETED:
                     is_abandoned = (call["abandoned"] == 1)
@@ -823,6 +856,7 @@ class CallRepo:
                                 AgentState.WRAP_UP,
                                 call_id=call_id,
                                 expect_call_id=call_id,
+                                now=ts,
                             )
                             if not applied_agent:
                                 # Release idle agent if call completed before connecting
@@ -832,6 +866,7 @@ class CallRepo:
                                     AgentState.AVAILABLE,
                                     call_id=call_id,
                                     expect_call_id=call_id,
+                                    now=ts,
                                 ):
                                     agent_repo.transition(
                                         agent_id,
@@ -839,6 +874,7 @@ class CallRepo:
                                         AgentState.AVAILABLE,
                                         call_id=call_id,
                                         expect_call_id=call_id,
+                                        now=ts,
                                     )
                         borrower_repo.mark_done(borrower_id)
 
@@ -850,6 +886,7 @@ class CallRepo:
                             AgentState.AVAILABLE,
                             call_id=call_id,
                             expect_call_id=call_id,
+                            now=ts,
                         ):
                             agent_repo.transition(
                                 agent_id,
@@ -857,6 +894,7 @@ class CallRepo:
                                 AgentState.AVAILABLE,
                                 call_id=call_id,
                                 expect_call_id=call_id,
+                                now=ts,
                             )
                     resolved_reason = reason if reason is not None else target_state.value
                     if resolved_reason in NON_PENALIZED:

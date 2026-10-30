@@ -202,47 +202,63 @@ def test_3b_approved_decreases_as_rate_rises(tmp_path):
         assert approvals[i] >= approvals[i + 1]
 
 
-def test_4_property_based_invariants(test_env):
-    """4. PROPERTY (random.Random(42), 500 iterations): universal safety bounds hold across randomized states."""
-    conn, controller, _ = test_env
+def test_4_property_based_invariants():
+    """4. PROPERTY (random.Random(42), 500 iterations): universal safety bounds hold across real seeded DBs."""
     rng = random.Random(42)
+    config = SafetyConfig()
+    controller = SafetyController(
+        config=config,
+        provider_health_fn=lambda t: {"prov_a": "CLOSED"},
+    )
 
     for i in range(500):
-        # Generate random snapshot inputs directly
+        conn = connect(":memory:")
+        init_schema(conn)
+        seed_borrower(conn)
+
+        now = 1000.0
         A = rng.randint(0, 50)
         wrap_up = rng.randint(0, 30)
-        D = rng.randint(0, 10)
-        unbound = rng.randint(0, 20)
-        pending_pred = rng.randint(0, 10)
+        seed_agents(conn, {AgentState.AVAILABLE: A, AgentState.WRAP_UP: wrap_up}, now=now)
+
+        # Random RINGING unbound calls
+        unbound = rng.randint(0, 30)
+        for u in range(unbound):
+            conn.execute(
+                """
+                INSERT INTO calls (id, borrower_id, agent_id, state, state_rank, attempt, created_at, updated_at)
+                VALUES (?, 'b_dummy', NULL, 'RINGING', 3, 1, ?, ?);
+                """,
+                (f"call_unbound_{u}", now - 10.0, now - 10.0),
+            )
+
+        # Random history
+        n_ans = rng.randint(0, 60)
+        n_noans = rng.randint(0, 60)
+        seed_call_history(conn, n_ans, n_noans, created_at=now - 30.0)
+
         req_calls = rng.randint(0, 100)
+        req = PacingRequest(mode=PacingMode.PREDICTIVE, requested_calls=req_calls, rationale={})
+        decision = controller.evaluate(conn, req, now=now)
 
-        credit = math.floor(controller.config.wrap_up_credit * wrap_up)
-        cap = max(0, A + credit - D)
-        N0 = unbound + pending_pred
-
-        p_hi = rng.uniform(0.1, 1.0)
-        k1 = math.floor(cap * controller.config.max_overdial_ratio) - N0
-        search_limit = math.floor(cap * 2.0) + 1
-        N_risk = max_total_calls_within_risk(cap, p_hi, controller.config.risk_limit, search_limit)
-        k2 = N_risk - N0
-
-        k = max(0, min(req_calls, k1, k2, controller.config.max_batch))
-
-        allowed_total = min(math.floor(cap * controller.config.max_overdial_ratio), N_risk)
-        excess = max(0, unbound - allowed_total)
-
-        if excess > 0:
-            approved = 0
-        else:
-            approved = k
-
-        # Verify property invariants
+        approved = decision.approved
         assert approved >= 0
         assert approved <= req_calls
         assert approved <= controller.config.max_batch
-        if p_hi < 1.0 and excess == 0 and approved > 0:
+
+        cap = decision.inputs.get("cap", 0)
+        p_hi = decision.inputs.get("p_hi", 1.0)
+        N0 = decision.inputs.get("N0", 0)
+        ratio = controller.config.max_overdial_ratio
+
+        if p_hi < 1.0 and approved > 0:
             assert binom_tail_gt(N0 + approved, p_hi, cap) <= controller.config.risk_limit
-            assert N0 + approved <= math.floor(cap * controller.config.max_overdial_ratio)
+            assert N0 + approved <= math.floor(cap * ratio)
+
+        if decision.verdict == "REJECTED" or "CAPACITY_EXCESS" in decision.reasons:
+            assert approved == 0
+
+        conn.close()
 
 
 def test_5_distributed_double_approval_serialized(tmp_path):
@@ -274,6 +290,7 @@ def test_5_distributed_double_approval_serialized(tmp_path):
     num_threads = 8
     barrier = threading.Barrier(num_threads)
     approvals = []
+    decisions = []
     lock = threading.Lock()
 
     def worker():
@@ -283,6 +300,7 @@ def test_5_distributed_double_approval_serialized(tmp_path):
         dec = ctrl.evaluate(c, PacingRequest(PacingMode.PREDICTIVE, 100, {}), now=1000.0)
         with lock:
             approvals.append(dec.approved)
+            decisions.append(dec)
         c.close()
 
     threads = [threading.Thread(target=worker) for _ in range(num_threads)]
@@ -291,9 +309,14 @@ def test_5_distributed_double_approval_serialized(tmp_path):
     for t in threads:
         t.join()
 
+    # Invariants on thread decisions
+    for d in decisions:
+        assert not any(r.startswith("SAFETY_ERROR") for r in d.reasons), f"Thread encountered safety error: {d.reasons}"
+    assert any(a > 0 for a in approvals), f"Expected at least one thread to be approved, got approvals: {approvals}"
+
     total_approved = sum(approvals)
-    assert total_approved <= allowed_baseline, (
-        f"Distributed double-approval occurred! total={total_approved} > baseline={allowed_baseline}"
+    assert total_approved == allowed_baseline, (
+        f"Distributed approvals sum mismatch: total={total_approved} != baseline={allowed_baseline}"
     )
 
 
@@ -313,7 +336,6 @@ def test_6_allotment_lifecycle_and_race_consumption(test_env):
     results = []
     lock = threading.Lock()
     barrier = threading.Barrier(16)
-    db_path = controller.config.abandon_window_s  # dummy access
 
     # Fetch DB path from connection
     cur_p = conn.execute("PRAGMA database_list;")

@@ -102,6 +102,9 @@ def validate_pacing_ast(source: str, filename: str = "<string>") -> None:
                 raise AssertionError(f"Forbidden pacing reference 'sys.modules' found in {filename}")
 
 
+validate_pacing_imports = validate_pacing_ast
+
+
 def get_identifiers_from_ast(tree: ast.AST) -> set[str]:
     """Collect all defined or referenced names/identifiers in an AST."""
     names = set()

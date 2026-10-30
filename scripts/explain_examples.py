@@ -88,7 +88,7 @@ def main():
     conn_b = connect(":memory:")
     init_schema(conn_b)
 
-    # 1. Seed 10 AVAILABLE agents (cap = 10, max overdial ratio = 1.2 -> allowed = 12)
+    # 1. Seed 10 AVAILABLE agents (cap = 10, max overdial ratio = 1.5 -> allowed = 15)
     for i in range(10):
         conn_b.execute(
             "INSERT INTO agents (id, state, updated_at) VALUES (?, 'AVAILABLE', ?)",
