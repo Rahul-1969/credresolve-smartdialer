@@ -60,6 +60,13 @@ class World:
         self.sim_wrap_up_s = sim_wrap_up_s
         self.now = clock.now
         self._last_reaper_sweep = 0.0
+        self.reaper_totals: dict[str, int] = {
+            "reconciled_reserved": 0,
+            "reconciled_stuck": 0,
+            "released_borrowers": 0,
+            "released_agents": 0,
+            "deferred": 0,
+        }
         self._worker_conns = worker_conns or []
         self.conn = connect(db_path)
 
@@ -93,7 +100,9 @@ class World:
             reports.append(rep)
 
         if self.now - self._last_reaper_sweep >= self.config.reaper_interval:
-            self.reaper.sweep(self.now)
+            sweep_res = self.reaper.sweep(self.now)
+            for k, v in sweep_res.items():
+                self.reaper_totals[k] = self.reaper_totals.get(k, 0) + v
             self._last_reaper_sweep = self.now
 
         return reports

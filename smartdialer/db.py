@@ -172,6 +172,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
         ON calls(created_at);
         """,
         """
+        CREATE INDEX IF NOT EXISTS idx_calls_answered_at
+        ON calls(answered_at);
+        """,
+        """
         CREATE INDEX IF NOT EXISTS idx_safety_allotments_campaign_expires
         ON safety_allotments(campaign_id, expires_at);
         """,

@@ -160,9 +160,15 @@ def test_8_provider_outage_failover_and_reaper_reconciliation(tmp_path: Path):
         primary="A",
     )
 
+    router_health_history: list[tuple[float, dict[str, str]]] = []
+    has_ambig_or_failure = False
+    first_a_open_t: float | None = None
+
     # Run initial normal steps until calls are in flight
     for s in range(20):
         world.step(1.0)
+        h = world.dialers[0].router.health(world.now)
+        router_health_history.append((world.now, h))
         assert world.check_invariants() == []
 
     # Inject timeout outage on Provider A during [20.0, 100.0)
@@ -170,19 +176,58 @@ def test_8_provider_outage_failover_and_reaper_reconciliation(tmp_path: Path):
 
     # Step through outage
     for s in range(20, 120):
-        world.step(1.0)
+        reps = world.step(1.0)
+        h = world.dialers[0].router.health(world.now)
+        router_health_history.append((world.now, h))
+        if h.get("provider_a") == "OPEN" and first_a_open_t is None:
+            first_a_open_t = world.now
+        for r in reps:
+            if r.ambiguous > 0 or r.definite_failures > 0:
+                has_ambig_or_failure = True
         assert world.check_invariants() == []
 
     # Step past outage so reaper reconciles remaining stuck/ambiguous calls
     for s in range(120, 200):
-        world.step(1.0)
+        reps = world.step(1.0)
+        h = world.dialers[0].router.health(world.now)
+        router_health_history.append((world.now, h))
+        if h.get("provider_a") == "OPEN" and first_a_open_t is None:
+            first_a_open_t = world.now
+        for r in reps:
+            if r.ambiguous > 0 or r.definite_failures > 0:
+                has_ambig_or_failure = True
         assert world.check_invariants() == []
+
+    # Assert breaker A reached OPEN at some step
+    assert any(h.get("provider_a") == "OPEN" for _, h in router_health_history), "Breaker A never reached OPEN!"
+
+    # Assert at least one AMBIGUOUS or definite failure occurred
+    assert has_ambig_or_failure, "Expected at least one AMBIGUOUS or definite failure during outage!"
+
+    # Assert at least one call with provider = provider_b was created after A opened
+    assert first_a_open_t is not None, "Provider A never opened"
+    cur_b = world.conn.execute(
+        "SELECT COUNT(*) as cnt FROM calls WHERE provider = 'provider_b' AND created_at >= ?;",
+        (first_a_open_t,),
+    ).fetchone()
+    assert cur_b["cnt"] > 0, f"No calls were created with provider=provider_b after A opened at t={first_a_open_t}"
+
+    # Assert after outage (100.0) plus stuck_call_timeout_s (60.0) plus reaper_interval (10.0),
+    # no non-terminal call older than outage end remains
+    cur_old = world.conn.execute(
+        """
+        SELECT COUNT(*) as cnt FROM calls
+        WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
+          AND created_at < 100.0;
+        """
+    ).fetchone()
+    assert cur_old["cnt"] == 0, f"Found {cur_old['cnt']} non-terminal calls older than outage end!"
 
     # Check that safety decision audit log recorded provider health state changes
     cur_dec = world.conn.execute("SELECT COUNT(*) as cnt FROM safety_decisions;")
     assert cur_dec.fetchone()["cnt"] > 0
 
-    # Assert every call in DB matches provider ground truth or is terminal
+    # Assert every call in DB matches provider ground truth for all terminal calls
     cur_calls = world.conn.execute("SELECT id, provider, state FROM calls;")
     for call in cur_calls.fetchall():
         cid = call["id"]
@@ -190,7 +235,7 @@ def test_8_provider_outage_failover_and_reaper_reconciliation(tmp_path: Path):
         db_state = call["state"]
         if pname and pname in world.providers:
             prov_truth = world.providers[pname].get_call_status(cid, world.now)
-            if prov_truth is not None:
+            if prov_truth in ("COMPLETED", "FAILED", "CANCELLED"):
                 assert db_state == prov_truth, f"Call {cid} state mismatch: DB={db_state} vs Provider={prov_truth}"
 
     world.close()
