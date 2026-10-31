@@ -51,7 +51,8 @@ def transaction(conn: sqlite3.Connection):
     """Context manager for explicit immediate and re-entrant transactions.
 
     If conn.in_transaction is already True, uses a uniquely named SAVEPOINT.
-    Otherwise executes BEGIN IMMEDIATE, committing on success or rolling back on exception.
+    Otherwise executes BEGIN IMMEDIATE with bounded jittered retry on 'database is locked',
+    committing on success or rolling back on exception. Never retries the transaction body.
     """
     if conn.in_transaction:
         sp_name = f"sp_{uuid.uuid4().hex}"
@@ -67,7 +68,19 @@ def transaction(conn: sqlite3.Connection):
                 pass
             raise
     else:
-        conn.execute("BEGIN IMMEDIATE;")
+        max_attempts = 8
+        base_delay = 0.01
+        for attempt in range(max_attempts):
+            try:
+                conn.execute("BEGIN IMMEDIATE;")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc).lower() and attempt < max_attempts - 1:
+                    sleep_sec = base_delay * (2 ** attempt) + random.uniform(0.005, 0.02)
+                    time.sleep(sleep_sec)
+                else:
+                    raise
+
         try:
             yield conn
             conn.execute("COMMIT;")
@@ -160,26 +173,34 @@ class AgentRepo:
 
         def _op() -> list[str]:
             with transaction(self.conn):
-                cur = self.conn.execute(
+                cur_cand = self.conn.execute(
                     """
-                    UPDATE agents
-                    SET state = 'RESERVED',
-                        reserved_by = ?,
-                        lease_expires_at = ?,
-                        version = version + 1,
-                        updated_at = ?
-                    WHERE id IN (
-                        SELECT id FROM agents
-                        WHERE state = 'AVAILABLE'
-                        ORDER BY available_since ASC
-                        LIMIT ?
-                    )
-                    AND state = 'AVAILABLE'
-                    RETURNING id;
+                    SELECT id FROM agents
+                    WHERE state = 'AVAILABLE'
+                    ORDER BY available_since ASC
+                    LIMIT ?;
                     """,
-                    (worker_id, lease_expires, ts, n),
+                    (n,),
                 )
-                reserved_ids = [row["id"] for row in cur.fetchall()]
+                cand_ids = [row["id"] for row in cur_cand.fetchall()]
+                reserved_ids = []
+
+                for agent_id in cand_ids:
+                    cur_up = self.conn.execute(
+                        """
+                        UPDATE agents
+                        SET state = 'RESERVED',
+                            reserved_by = ?,
+                            lease_expires_at = ?,
+                            version = version + 1,
+                            updated_at = ?
+                        WHERE id = ? AND state = 'AVAILABLE'
+                        RETURNING id;
+                        """,
+                        (worker_id, lease_expires, ts, agent_id),
+                    )
+                    if cur_up.fetchone() is not None:
+                        reserved_ids.append(agent_id)
 
                 # Record audit trail and optional call mapping in the same transaction
                 for idx, agent_id in enumerate(reserved_ids):
@@ -348,26 +369,36 @@ class BorrowerRepo:
 
         def _op() -> list[str]:
             with transaction(self.conn):
-                cur = self.conn.execute(
+                cur_cand = self.conn.execute(
                     """
-                    UPDATE borrowers
-                    SET state = 'CLAIMED',
-                        claimed_by = ?,
-                        lease_expires_at = ?,
-                        version = version + 1,
-                        updated_at = ?
-                    WHERE id IN (
-                        SELECT id FROM borrowers
-                        WHERE state = 'QUEUED' AND next_attempt_at <= ?
-                        ORDER BY next_attempt_at ASC
-                        LIMIT ?
-                    )
-                    AND state = 'QUEUED'
-                    RETURNING id;
+                    SELECT id FROM borrowers
+                    WHERE state = 'QUEUED' AND next_attempt_at <= ?
+                    ORDER BY next_attempt_at ASC
+                    LIMIT ?;
                     """,
-                    (worker_id, lease_expires, ts, ts, n),
+                    (ts, n),
                 )
-                return [row["id"] for row in cur.fetchall()]
+                cand_ids = [row["id"] for row in cur_cand.fetchall()]
+                claimed_ids = []
+
+                for b_id in cand_ids:
+                    cur_up = self.conn.execute(
+                        """
+                        UPDATE borrowers
+                        SET state = 'CLAIMED',
+                            claimed_by = ?,
+                            lease_expires_at = ?,
+                            version = version + 1,
+                            updated_at = ?
+                        WHERE id = ? AND state = 'QUEUED'
+                        RETURNING id;
+                        """,
+                        (worker_id, lease_expires, ts, b_id),
+                    )
+                    if cur_up.fetchone() is not None:
+                        claimed_ids.append(b_id)
+
+                return claimed_ids
 
         return with_retry(_op, self.conn)
 

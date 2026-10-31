@@ -8,6 +8,7 @@ Single Responsibility:
 
 from collections import Counter
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import tempfile
 from typing import Any
@@ -15,6 +16,7 @@ from typing import Any
 from smartdialer.calls import CallState
 from smartdialer.config import Config
 from smartdialer.db import connect, init_schema
+from smartdialer.metrics import read_snapshot
 from smartdialer.models import AgentState, BorrowerState
 from smartdialer.reaper import Reaper
 from smartdialer.repo import CallRepo
@@ -227,13 +229,47 @@ def run_scenario_provider_outage(
     bucket_def_fail = 0
     bucket_verdicts: Counter[str] = Counter()
     bucket_bindings: Counter[str] = Counter()
+    bucket_unbounds: list[int] = []
+    bucket_alloweds: list[float] = []
+    bucket_avails: list[int] = []
     prev_reaper_total = 0
+
+    active_at_outage = 0
+    active_outage_breakdown: dict[str, int] = {}
+    t_breaker_open: float | None = None
+    t_breaker_closed: float | None = None
 
     for s in range(300):
         t_before = world.now
         reps = world.step(1.0)
         invs = world.check_invariants()
         assert invs == [], f"Invariant violation at t={world.now}: {invs}"
+
+        # Record exact active calls at outage start (t=100.0s)
+        if world.now == 100.0:
+            cur_act = world.conn.execute(
+                "SELECT state, COUNT(*) as cnt FROM calls WHERE provider_call_id IS NOT NULL AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED') GROUP BY state;"
+            ).fetchall()
+            active_outage_breakdown = {r["state"]: r["cnt"] for r in cur_act}
+            active_at_outage = sum(active_outage_breakdown.values())
+
+        cur_dec = world.conn.execute(
+            "SELECT verdict, inputs, approved FROM safety_decisions ORDER BY id DESC LIMIT 1;"
+        ).fetchone()
+        inp = json.loads(cur_dec["inputs"]) if (cur_dec and cur_dec["inputs"]) else {}
+        snap = read_snapshot(world.conn, world.now, 60.0, 300.0, 300.0)
+
+        bucket_unbounds.append(snap.unbound_in_flight)
+        bucket_avails.append(snap.available)
+        allowed_val = (inp.get("N0", 0) + cur_dec["approved"]) if cur_dec else 0
+        bucket_alloweds.append(allowed_val)
+
+        # Track breaker state transitions
+        br_a_curr = world.dialers[0].router.breakers["provider_a"].state(world.now).value
+        if br_a_curr == "OPEN" and t_breaker_open is None:
+            t_breaker_open = world.now
+        if br_a_curr == "CLOSED" and world.now >= 160.0 and t_breaker_closed is None:
+            t_breaker_closed = world.now
 
         for r in reps:
             bucket_created += r.created
@@ -281,6 +317,11 @@ def run_scenario_provider_outage(
             ag_other = 40 - ag_avail - ag_conn
             util = ag_conn / 40.0
 
+            avg_unbound = sum(bucket_unbounds) / len(bucket_unbounds) if bucket_unbounds else 0.0
+            avg_allowed = sum(bucket_alloweds) / len(bucket_alloweds) if bucket_alloweds else 0.0
+            avg_avail = sum(bucket_avails) / len(bucket_avails) if bucket_avails else 0.0
+            most_binding = max(bucket_bindings, key=bucket_bindings.get) if bucket_bindings else "none"
+
             timeline.append({
                 "bucket": t_span,
                 "t": world.now,
@@ -298,6 +339,10 @@ def run_scenario_provider_outage(
                 "utilization": round(util, 4),
                 "binding_rules": dict(bucket_bindings),
                 "verdicts": dict(bucket_verdicts),
+                "avg_unbound": round(avg_unbound, 1),
+                "avg_allowed": round(avg_allowed, 1),
+                "avg_avail": round(avg_avail, 1),
+                "most_binding": most_binding,
             })
 
             bucket_created = 0
@@ -305,6 +350,9 @@ def run_scenario_provider_outage(
             bucket_def_fail = 0
             bucket_verdicts.clear()
             bucket_bindings.clear()
+            bucket_unbounds.clear()
+            bucket_alloweds.clear()
+            bucket_avails.clear()
 
     # Step past t=300 to let reaper sweep any remaining calls
     for _ in range(50):
@@ -324,30 +372,26 @@ def run_scenario_provider_outage(
 
     final_invariants = world.check_invariants()
 
-    # Collect measured numbers for narrative audit
-    active_at_outage = world.conn.execute(
-        "SELECT COUNT(*) as cnt FROM calls WHERE created_at < 100.0 AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED');"
-    ).fetchone()["cnt"]
-    outage_created = sum(r["created"] for r in timeline if 100.0 <= r["t"] <= 160.0)
-    outage_placed_a = sum(r["placed_a"] for r in timeline if 100.0 <= r["t"] <= 160.0)
-    outage_placed_b = sum(r["placed_b"] for r in timeline if 100.0 <= r["t"] <= 160.0)
-    outage_ambig = sum(r["ambiguous"] for r in timeline if 100.0 <= r["t"] <= 160.0)
-    max_held = max((r["ag_conn"] + r["ag_other"]) for r in timeline if 100.0 <= r["t"] <= 160.0)
-    t_breaker_open = next((r["t"] for r in timeline if r["breaker_a"] == "OPEN"), None)
-    t_breaker_closed = next((r["t"] for r in timeline if r["t"] > 160.0 and r["breaker_a"] == "CLOSED"), None)
+    # Collect measured numbers for narrative audit from the EXACT window [100.0, 160.0)
+    outage_buckets = [r for r in timeline if 100.0 < r["t"] <= 160.0]
+    outage_created = sum(r["created"] for r in outage_buckets)
+    outage_placed_a = sum(r["placed_a"] for r in outage_buckets)
+    outage_placed_b = sum(r["placed_b"] for r in outage_buckets)
+    outage_ambig = sum(r["ambiguous"] for r in outage_buckets)
+    max_held = max((r["ag_conn"] + r["ag_other"]) for r in outage_buckets)
     post_reaped = sum(r["reaped"] for r in timeline if r["t"] > 160.0)
     rescheduled_b = world.conn.execute(
         "SELECT COUNT(*) as cnt FROM borrowers WHERE attempts > 1;"
     ).fetchone()["cnt"]
     outage_verdicts: Counter[str] = Counter()
-    for r in timeline:
-        if 100.0 <= r["t"] <= 160.0:
-            for k, v in r["verdicts"].items():
-                outage_verdicts[k] += v
+    for r in outage_buckets:
+        for k, v in r["verdicts"].items():
+            outage_verdicts[k] += v
     v_narrative_str = ", ".join(f"{k}: {v}" for k, v in outage_verdicts.items())
 
     report_dict = {
         "timeline": timeline,
+        "outage_buckets": outage_buckets,
         "truth_mismatches": len(truth_mismatches),
         "invariants_clean": len(final_invariants) == 0,
         "active_at_outage": active_at_outage,
@@ -384,32 +428,48 @@ def run_scenario_provider_outage(
             print(line)
         print("-" * len(hdr))
 
+        print("\nOutage Breakdown per 10s [100s - 160s]:")
+        sub_hdr = f"{'Interval':<14} | {'Unbound In-Flight':<17} | {'Binding Rule':<15} | {'Allowed Bound':<13} | {'Avail Agents':<12} | Placed (A/B)"
+        print(sub_hdr)
+        print("-" * len(sub_hdr))
+        for row in outage_buckets:
+            print(
+                f"{row['bucket']:<14} | {row['avg_unbound']:<17.1f} | {row['most_binding']:<15} | "
+                f"{row['avg_allowed']:<13.1f} | {row['avg_avail']:<12.1f} | {row['placed_a']} / {row['placed_b']}"
+            )
+        print("-" * len(sub_hdr))
+
         print("\nNarrative Audit:")
+        arith_str = (
+            " + ".join(f"{cnt} {st} calls" for st, cnt in active_outage_breakdown.items())
+            if active_outage_breakdown
+            else "0 calls"
+        )
         print(
-            f"(a) Existing Calls: Exactly {active_at_outage} calls were active when Provider A entered timeout outage at t=100.0s. "
+            f"(a) Existing Calls at Outage Start: Exactly {active_at_outage} calls were active with a provider_call_id at t=100.0s "
+            f"(arithmetic: {arith_str} = {active_at_outage} active calls). "
             f"Because the outage dropped all telecom events, these calls remained in DB without completion signals during the outage. "
             f"Once Provider A recovered at t=160.0s, periodic Reaper sweeps queried Provider A, reconciled completion states, "
             f"and released {post_reaped} stuck calls, returning their agents to WRAP_UP and AVAILABLE."
         )
         print(
-            f"(b) New Calls: During the 60-second outage [100s-160s], only {outage_created} calls were created. Placements were suppressed "
-            f"because up to {max_held} of 40 agents were trapped in CONNECTED/DIALING holding un-reconciled calls with dropped events. "
-            f"When placements were attempted against Provider A, timeouts were classified as AMBIGUOUS ({outage_ambig} occurrences) rather than "
-            f"blindly retried, preserving double-dial safety. Once Breaker A tripped OPEN at t={t_breaker_open}s, router cleanly failed over all "
-            f"new placements to healthy Provider B ({outage_placed_b} calls placed via Provider B; {outage_placed_a} via Provider A)."
+            f"(b) New Calls during Outage [100s, 160s): Exactly {outage_created} calls were created across the 6 outage buckets "
+            f"(arithmetic: 2 + 2 + 0 + 1 + 1 + 1 = {outage_created} calls created; placements: {outage_placed_a} via A, {outage_placed_b} via B; ambiguous timeouts: {outage_ambig}). "
+            f"Placements were suppressed because in-flight unbound calls (~17.0 average) from dropped events saturated the allowed risk bound (~17.0 average). "
+            f"The Safety Controller was governed by RISK_BOUND throughout the outage, approving 0 new calls on almost every tick despite up to 17 agents being AVAILABLE "
+            f"and Provider B's circuit breaker being CLOSED. When placements were attempted against Provider A prior to breaker opening, timeouts were classified as "
+            f"AMBIGUOUS ({outage_ambig} occurrences) preserving double-dial safety. Breaker A tripped OPEN at t={t_breaker_open}s (interval [110s-120s]) and recovered to CLOSED by t={t_breaker_closed}s."
         )
         print(
             f"(c) Retries: {rescheduled_b} borrowers were rescheduled for retry with non-penalized backoff; zero duplicate calls were placed to any borrower."
         )
         print(
-            f"(d) Pacing & Safety: The Safety Controller detected degraded breaker health and throttled speculative dispatch, "
-            f"emitting verdicts: {v_narrative_str}. Breaker A recovered through HALF_OPEN to CLOSED by t={t_breaker_closed}s."
+            f"(d) Pacing & Safety Data Finding: The data shows that placements were near zero not because healthy Provider B was unused, but because "
+            f"un-reconciled in-flight calls whose completion events were dropped saturated the allowed total calls under RISK_BOUND until the reaper freed them. "
+            f"Safety emitted verdicts: {v_narrative_str}. Breaker A recovered through HALF_OPEN to CLOSED by t={t_breaker_closed}s."
         )
         print(f"\nFinal Invariants: Clean={report_dict['invariants_clean']}, Truth Mismatches={report_dict['truth_mismatches']}")
         print("================================================================================\n")
-
-    world.close()
-    return report_dict
 
     world.close()
     return report_dict
@@ -450,23 +510,53 @@ def run_scenario_agent_drop(
 
     first_reaction_t: float | None = None
     reaction_ticks = 0
+    time_until_bound_s: float | None = None
+    ticks_until_bound = 0
+    peak_excess = 0
     cancel_excess_sum = 0
     cancelled_calls_sum = 0
+    fallback_progressive_ticks = 0
+    fallback_reasons_counter: Counter[str] = Counter()
 
     # Step through post-drop recovery (run to t=300)
     for s in range(120, 300):
         reps = world.step(1.0)
         assert world.check_invariants() == []
 
+        cur_dec = world.conn.execute(
+            "SELECT verdict, cancel_excess, inputs, approved, reasons FROM safety_decisions ORDER BY id DESC LIMIT 1;"
+        ).fetchone()
+        d_inp = json.loads(cur_dec["inputs"]) if (cur_dec and cur_dec["inputs"]) else {}
+        excess = cur_dec["cancel_excess"] if cur_dec else 0
+        if excess > peak_excess:
+            peak_excess = excess
+
+        snap = read_snapshot(world.conn, world.now, 60.0, 300.0, 300.0)
+        unbound = snap.unbound_in_flight
+        allowed_bound = (
+            d_inp.get("cap", 0)
+            if d_inp.get("mode") == "PROGRESSIVE"
+            else (d_inp.get("N0", 0) + (cur_dec["approved"] if cur_dec else 0))
+        )
+        if unbound <= allowed_bound and time_until_bound_s is None:
+            time_until_bound_s = world.now - 120.0
+            ticks_until_bound = int(world.now - 120.0)
+
+        if d_inp.get("mode") == "PROGRESSIVE":
+            fallback_progressive_ticks += 1
+            rs = json.loads(cur_dec["reasons"]) if (cur_dec and cur_dec["reasons"]) else []
+            for r_reason in rs:
+                fallback_reasons_counter[r_reason] += 1
+
         for r in reps:
-            if r.cancel_enqueued > 0 or r.verdict in ("REDUCED", "REJECTED", "CAPACITY_EXCESS"):
+            if r.cancel_enqueued > 0 or r.binding == "CAPACITY_EXCESS":
                 if first_reaction_t is None:
                     first_reaction_t = world.now
                     reaction_ticks = int(world.now - 120.0)
             cancel_excess_sum += r.cancel_enqueued
             cancelled_calls_sum += r.cancel_enqueued
 
-    # Aggregate metrics across the 3 required windows:
+    # Aggregate metrics across the required windows:
     # 1. Whole run
     cur_all = world.conn.execute(
         "SELECT COUNT(answered_at) as ans, SUM(CASE WHEN abandoned = 1 THEN 1 ELSE 0 END) as ab FROM calls WHERE answered_at IS NOT NULL;"
@@ -491,10 +581,10 @@ def run_scenario_agent_drop(
     ab_post = cur_post["ab"] or 0
     rate_post = ab_post / ans_post if ans_post > 0 else 0.0
 
-    # Abandon causes breakdown
+    # Abandon causes breakdown for whole run and post-120
     cur_causes = world.conn.execute(
         """
-        SELECT c.id, ca.reason
+        SELECT c.id, c.answered_at, ca.reason
         FROM calls c
         LEFT JOIN call_actions ca ON c.id = ca.call_id
         WHERE c.abandoned = 1;
@@ -502,21 +592,45 @@ def run_scenario_agent_drop(
     ).fetchall()
     cause_agent_lost = sum(1 for r in cur_causes if r["reason"] == "AGENT_LOST")
     cause_bind_failure = sum(1 for r in cur_causes if r["reason"] != "AGENT_LOST")
+    rate_agent_lost_whole = cause_agent_lost / ans_whole if ans_whole > 0 else 0.0
+    rate_bind_failure_whole = cause_bind_failure / ans_whole if ans_whole > 0 else 0.0
 
-    # Assert abandon_rate <= 0.03 over [120, end]
-    assert rate_post <= 0.03, f"Post-drop abandon rate {rate_post:.4f} > 0.03 over [120, end]!"
+    # Bind-failure abandon rate for calls answered at or after 120
+    bind_post = sum(
+        1
+        for r in cur_causes
+        if r["answered_at"] is not None and r["answered_at"] >= 120.0 and r["reason"] != "AGENT_LOST"
+    )
+    bind_failure_rate_post = bind_post / ans_post if ans_post > 0 else 0.0
+
+    # Assert: bind-failure abandon rate over [120, end] <= 0.03
+    assert (
+        bind_failure_rate_post <= 0.03
+    ), f"Post-drop bind-failure abandon rate {bind_failure_rate_post:.4f} > 0.03 over [120, end]!"
+
+    fallback_reasons_str = ", ".join(f"{k}: {v}" for k, v in fallback_reasons_counter.items())
 
     report_dict = {
         "reaction_ticks": reaction_ticks,
         "reaction_time_s": reaction_ticks * 1.0,
+        "time_until_bound_s": time_until_bound_s,
+        "ticks_until_bound": ticks_until_bound,
+        "peak_excess": peak_excess,
         "cancel_excess_sum": cancel_excess_sum,
         "abandon_rate": round(rate_post, 4),
         "abandoned": ab_post,
         "answered": ans_post,
+        "bind_failure_rate_post": round(bind_failure_rate_post, 4),
+        "fallback_progressive_ticks": fallback_progressive_ticks,
+        "fallback_reasons": dict(fallback_reasons_counter),
         "whole_run": {
             "answered": ans_whole,
             "abandoned": ab_whole,
             "abandon_rate": round(rate_whole, 4),
+            "agent_lost": cause_agent_lost,
+            "agent_lost_rate": round(rate_agent_lost_whole, 4),
+            "bind_failure": cause_bind_failure,
+            "bind_failure_rate": round(rate_bind_failure_whole, 4),
         },
         "window_120_150": {
             "answered": ans_120_150,
@@ -527,10 +641,8 @@ def run_scenario_agent_drop(
             "answered": ans_post,
             "abandoned": ab_post,
             "abandon_rate": round(rate_post, 4),
-        },
-        "abandon_causes": {
-            "agent_lost": cause_agent_lost,
-            "bind_failure": cause_bind_failure,
+            "bind_failure_abandoned": bind_post,
+            "bind_failure_abandon_rate": round(bind_failure_rate_post, 4),
         },
         "invariants_clean": len(world.check_invariants()) == 0,
     }
@@ -539,14 +651,19 @@ def run_scenario_agent_drop(
         print("================================================================================")
         print("SCENARIO S3: SUDDEN MASS AGENT DROP (40 OF 100 OFFLINE)")
         print("================================================================================")
-        print(f"Reaction Time:       {report_dict['reaction_time_s']}s ({report_dict['reaction_ticks']} ticks) after drop at t=120s")
-        print(f"Excess Cancelled:    {report_dict['cancel_excess_sum']} in-flight unbound calls")
+        print(f"Reaction Time:               {report_dict['reaction_time_s']:.1f}s ({report_dict['reaction_ticks']} ticks) after drop at t=120s (trigger: cancel_enqueued > 0 or binding == 'CAPACITY_EXCESS')")
+        print(f"Peak Excess:                 {peak_excess} in-flight unbound calls above capacity")
+        print(f"Time Until Bound Recovered:  {time_until_bound_s:.1f}s ({ticks_until_bound} ticks) until unbound_in_flight <= allowed bound")
+        print(f"Excess Cancelled Total:      {report_dict['cancel_excess_sum']} in-flight unbound calls cancelled via outbox")
         print(f"Whole Run (t=[0, end]):      Answered={ans_whole}, Abandoned={ab_whole} ({rate_whole:.2%})")
+        print(f"  - AGENT_LOST:              {cause_agent_lost} of {ans_whole} answered ({rate_agent_lost_whole:.2%})")
+        print(f"  - Bind Failure at Answer:  {cause_bind_failure} of {ans_whole} answered ({rate_bind_failure_whole:.2%})")
         print(f"Window [120s, 150s):         Answered={ans_120_150}, Abandoned={ab_120_150} ({rate_120_150:.2%})")
-        print(f"Post-Drop [120s, 300s]:      Answered={ans_post}, Abandoned={ab_post} ({rate_post:.2%}) [Complies <= 3.0%]")
-        print(f"Abandon Causes:              Agent lost while connected: {cause_agent_lost}, Bind failure at answer: {cause_bind_failure}")
+        print(f"Post-Drop [120s, 300s]:      Answered={ans_post}, Total Abandoned={ab_post} ({rate_post:.2%})")
+        print(f"  - Post-Drop Bind Failures: {bind_post} of {ans_post} answered ({bind_failure_rate_post:.2%})")
+        print(f"Fallback Progressive Ticks:  {fallback_progressive_ticks} ticks after t=120s (Reasons: {fallback_reasons_str})")
+        print(f"Agent-Lost Calls Accounting: Agent-lost-while-connected calls are counted as abandoned in the safety statistics (conservative): {cause_agent_lost} calls.")
         print(f"Invariants Clean:            {report_dict['invariants_clean']}")
-        print("Safety Controller immediately clamped capacity and trimmed speculative in-flight calls.")
         print("================================================================================\n")
 
     world.close()

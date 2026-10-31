@@ -34,6 +34,8 @@ class SimulationMetrics:
     calls_created: int
     calls_initiated: int
     calls_connected: int
+    cancelled: int
+    cancelled_unanswered_pct: float
     answered: int
     no_answer: int
     abandoned: int
@@ -244,6 +246,7 @@ def run_single_simulation(
             SUM(CASE WHEN end_reason = 'NO_ANSWER' THEN 1 ELSE 0 END) as no_answer,
             SUM(CASE WHEN answered_at IS NOT NULL AND abandoned = 0 AND agent_id IS NOT NULL THEN 1 ELSE 0 END) as connected,
             COALESCE(SUM(abandoned), 0) as abandoned,
+            SUM(CASE WHEN state = 'CANCELLED' THEN 1 ELSE 0 END) as cancelled,
             SUM(CASE WHEN provider = 'provider_a' AND provider_call_id IS NOT NULL THEN 1 ELSE 0 END) as placed_via_a,
             SUM(CASE WHEN provider = 'provider_b' AND provider_call_id IS NOT NULL THEN 1 ELSE 0 END) as placed_via_b
         FROM calls;
@@ -256,6 +259,8 @@ def run_single_simulation(
     no_answer = cur_db["no_answer"] or 0
     connected = cur_db["connected"] or 0
     abandoned = cur_db["abandoned"] or 0
+    cancelled = cur_db["cancelled"] or 0
+    cancelled_unanswered_pct = round(cancelled / total_created, 4) if total_created > 0 else 0.0
     placed_via_a = cur_db["placed_via_a"] or 0
     placed_via_b = cur_db["placed_via_b"] or 0
 
@@ -336,14 +341,16 @@ def run_single_simulation(
             WHERE c.abandoned = 1;
             """
         ).fetchall()
+        cred_gt0_ids = set()
         for r in cur_cred:
             if r["latest_inputs"]:
                 try:
                     inp = json.loads(r["latest_inputs"])
                     if inp.get("credit", 0) > 0:
-                        abandoned_credit_gt_0 += 1
+                        cred_gt0_ids.add(r["id"])
                 except Exception:
                     pass
+        abandoned_credit_gt_0 = len(cred_gt0_ids)
 
     # Scenario D phases and jump window audit
     phase_answer_rates: dict[str, float] = {}
@@ -452,6 +459,8 @@ def run_single_simulation(
         calls_created=total_created,
         calls_initiated=initiated,
         calls_connected=connected,
+        cancelled=cancelled,
+        cancelled_unanswered_pct=cancelled_unanswered_pct,
         answered=answered,
         no_answer=no_answer,
         abandoned=abandoned,
@@ -535,9 +544,9 @@ def run_full_suite(
         fieldnames = [
             "scenario", "variant", "mode", "duration", "agents", "seed",
             "utilization", "implied_utilization", "calls_created", "calls_initiated",
-            "calls_connected", "answered", "no_answer", "abandoned", "abandon_rate",
-            "observed_answer_rate", "placed_via_a", "placed_via_b", "failovers",
-            "reaper_reconciled", "abandon_bind_failure", "abandon_agent_lost",
+            "calls_connected", "cancelled", "cancelled_unanswered_pct", "answered", "no_answer",
+            "abandoned", "abandon_rate", "observed_answer_rate", "placed_via_a", "placed_via_b",
+            "failovers", "reaper_reconciled", "abandon_bind_failure", "abandon_agent_lost",
             "abandoned_credit_gt_0", "mean_requested", "mean_approved",
             "verdict_approved", "verdict_reduced", "verdict_rejected", "verdict_fallback",
             "placement_failures", "ambiguous", "reconciled", "max_unbound",
@@ -584,10 +593,10 @@ def build_simulation_markdown(
     lines.append(f"\n**Parameters**: Agents={agents}, Duration={duration}s, Seed={seed}")
     lines.append("\n## Comprehensive Benchmark Table\n")
     lines.append(
-        "| Scenario | Variant | Mode | Utilization | Implied Util | Created | Initiated | Answered | Connected | Obs Ans Rate | Abandoned | Abandon Rate | Placed (A/B) | Failovers | Reaped | Aband Causes (Bind/Lost) | Aband Cred>0 | Mean Req/App | Fallbacks | Fail/Ambig | Max Unb |"
+        "| Scenario | Variant | Mode | Utilization | Implied Util | Created | Initiated | Answered | Connected | Cancelled | Canc % | Obs Ans Rate | Abandoned | Abandon Rate | Placed (A/B) | Failovers | Reaped | Aband Causes (Bind/Lost) | Aband Cred>0 | Mean Req/App | Fallbacks | Fail/Ambig | Max Unb |"
     )
     lines.append(
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     )
 
     for m in metrics:
@@ -598,7 +607,7 @@ def build_simulation_markdown(
         cred_gt0 = str(m.abandoned_credit_gt_0) if m.mode == "predictive" else "N/A"
         lines.append(
             f"| **{m.scenario}** | {m.variant} | {m.mode} | **{m.utilization:.2%}** | {m.implied_utilization:.2%} | "
-            f"{m.calls_created} | {m.calls_initiated} | {m.answered} | {m.calls_connected} | {m.observed_answer_rate:.2%} | "
+            f"{m.calls_created} | {m.calls_initiated} | {m.answered} | {m.calls_connected} | {m.cancelled} | {m.cancelled_unanswered_pct:.2%} | {m.observed_answer_rate:.2%} | "
             f"{m.abandoned} | {m.abandon_rate:.2%} | {placed_ab} | {m.failovers} | {m.reaper_reconciled} | "
             f"{causes} | {cred_gt0} | {req_app} | {m.verdict_fallback} | {fail_amb} | {m.max_unbound} |"
         )
@@ -611,7 +620,7 @@ def build_simulation_markdown(
         "- **Scenario C (High Answer Rate 70%, Long Talk 180s)**: High answer probability restricts predictive overdialing; Safety Controller tightly bounds dispatch to prevent abandonment spikes.\n"
         "- **Scenario D (Dynamic Changing Conditions)**: Non-stationary regime where answer rates drop from 60% to 10% then jump to 70%, and talk time extends from 60s to 150s.\n"
         "- **Clean vs. Chaos**: Clean runs use primary Provider A. Chaos runs route to Provider B under an active 60s timeout outage (t=200s to t=260s) with delayed event delivery, forcing breaker trips, failover, and post-outage reaper reconciliation.\n"
-        "- **Utilization vs Compliance**: In all scenarios, Predictive pacing achieves superior agent utilization over Progressive pacing while strictly maintaining abandonment below the statutory 3.0% limit."
+        "- **Utilization vs Compliance**: In all scenarios, Predictive pacing achieves superior agent utilization over Progressive pacing while strictly maintaining abandonment below the 3% target used in this prototype."
     )
 
     # Narrative audit for Scenario D jump (Part 1.1)

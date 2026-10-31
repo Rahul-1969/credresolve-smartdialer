@@ -1,11 +1,12 @@
 """Concurrency and stress tests for atomic agent reservation and borrower claiming."""
 
 import threading
+import time
 import pytest
 
 from smartdialer.db import connect, init_schema
 from smartdialer.models import AgentState, BorrowerState
-from smartdialer.repo import AgentRepo, BorrowerRepo
+from smartdialer.repo import AgentRepo, BorrowerRepo, transaction
 
 
 def test_agent_reservation_race_200_times(tmp_path):
@@ -327,3 +328,50 @@ def test_borrower_claim_stress_50_borrowers_16_threads(tmp_path):
         assert row["state"] == BorrowerState.CLAIMED.value
         assert row["claimed_by"] is not None
     verify_conn.close()
+
+
+def test_transaction_retry_on_locked(tmp_path):
+    """Connection A holds BEGIN IMMEDIATE for 0.3s while Connection B (busy_timeout=10ms) enters transaction() and succeeds."""
+    db_file = tmp_path / "test_tx_retry.db"
+    init_c = connect(db_file)
+    init_schema(init_c)
+    init_c.close()
+
+    a_holding = threading.Event()
+    b_success = threading.Event()
+    b_errors: list[Exception] = []
+
+    def worker_a():
+        conn_a = connect(db_file)
+        try:
+            conn_a.execute("BEGIN IMMEDIATE;")
+            a_holding.set()
+            time.sleep(0.3)
+            conn_a.execute("COMMIT;")
+        finally:
+            conn_a.close()
+
+    def worker_b():
+        conn_b = connect(db_file)
+        conn_b.execute("PRAGMA busy_timeout=10;")
+        a_holding.wait()
+        # Brief pause to ensure connection A is holding the writer lock
+        time.sleep(0.02)
+        try:
+            with transaction(conn_b):
+                conn_b.execute("SELECT 1;")
+            b_success.set()
+        except Exception as exc:
+            b_errors.append(exc)
+        finally:
+            conn_b.close()
+
+    ta = threading.Thread(target=worker_a)
+    tb = threading.Thread(target=worker_b)
+    ta.start()
+    tb.start()
+    ta.join(timeout=5.0)
+    tb.join(timeout=5.0)
+
+    assert not b_errors, f"Connection B raised unexpected errors: {b_errors}"
+    assert b_success.is_set(), "Connection B failed to acquire transaction() within bounded retries"

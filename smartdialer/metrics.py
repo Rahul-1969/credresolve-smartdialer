@@ -60,7 +60,8 @@ def read_snapshot(
             SUM(CASE WHEN agent_id IS NULL AND state IN ('RESERVED', 'INITIATED', 'RINGING') THEN 1 ELSE 0 END) AS unanswered_unbound,
             SUM(CASE WHEN agent_id IS NOT NULL AND state IN ('RESERVED', 'INITIATED', 'RINGING') THEN 1 ELSE 0 END) AS bound_in_flight,
             SUM(CASE WHEN agent_id IS NULL AND state IN ('ANSWERED', 'CONNECTED') AND abandoned = 0 THEN 1 ELSE 0 END) AS answered_waiting
-        FROM calls;
+        FROM calls
+        WHERE state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED');
         """
     )
     call_row = cur_calls.fetchone()

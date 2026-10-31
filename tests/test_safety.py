@@ -9,6 +9,7 @@ import pytest
 
 from smartdialer.calls import RANK
 from smartdialer.db import connect, init_schema
+from smartdialer.metrics import read_snapshot
 from smartdialer.models import AgentState, CallState
 from smartdialer.pacing.base import PacingMode, PacingRequest
 from smartdialer.safety import (
@@ -672,3 +673,164 @@ def test_independent_k1_k2_computation(test_env):
 
         assert dec.inputs["k1"] == expected_k1
         assert dec.inputs["k2"] == expected_k2
+
+
+def test_snapshot_brute_force_comparison():
+    """Compare read_snapshot against a brute-force Python computation on a randomized database."""
+    rng = random.Random(12345)
+    conn = connect(":memory:")
+    init_schema(conn)
+
+    now = 1000.0
+    short_w = 60.0
+    long_w = 600.0
+    abandon_w = 3600.0
+
+    # 1. Seed agents
+    agent_states = list(AgentState)
+    agents_raw = []
+    for i in range(70):
+        aid = f"ag_{i:03d}"
+        st = rng.choice(agent_states)
+        conn.execute(
+            "INSERT INTO agents (id, state, updated_at) VALUES (?, ?, ?);",
+            (aid, st.value, now),
+        )
+        agents_raw.append({"id": aid, "state": st.value})
+
+    # 2. Seed dummy borrower
+    seed_borrower(conn, "b_test")
+
+    # 3. Seed calls
+    call_states = [st.value for st in CallState]
+    end_reasons = ["NO_ANSWER", "COMPLETED", "BUSY", "PROVIDER_ERROR", "CANCELLED", None]
+    calls_raw = []
+
+    for j in range(350):
+        cid = f"call_{j:04d}"
+        st = rng.choice(call_states)
+        aid = rng.choice([None, f"ag_{rng.randint(0, 69):03d}"])
+        created_at = now - rng.uniform(5.0, 1200.0)
+
+        # Answered at
+        is_answered = (st in ("ANSWERED", "CONNECTED", "COMPLETED")) or (rng.random() < 0.2 and st not in ("RESERVED", "INITIATED"))
+        answered_at = (created_at + rng.uniform(2.0, 20.0)) if is_answered else None
+        if answered_at and answered_at > now:
+            answered_at = now - rng.uniform(1.0, 10.0)
+
+        end_reason = rng.choice(end_reasons) if st in ("COMPLETED", "FAILED", "CANCELLED") else None
+        abandoned = 1 if (is_answered and rng.random() < 0.2) else 0
+
+        # updated_at for completed calls
+        updated_at = (answered_at + rng.uniform(10.0, 120.0)) if (st == "COMPLETED" and answered_at) else now
+
+        st_rank = RANK.get(CallState(st), 0)
+
+        conn.execute(
+            """
+            INSERT INTO calls (id, borrower_id, agent_id, state, state_rank, answered_at, end_reason, abandoned, created_at, updated_at)
+            VALUES (?, 'b_test', ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (cid, aid, st, st_rank, answered_at, end_reason, abandoned, created_at, updated_at),
+        )
+        calls_raw.append({
+            "id": cid,
+            "agent_id": aid,
+            "state": st,
+            "state_rank": st_rank,
+            "answered_at": answered_at,
+            "end_reason": end_reason,
+            "abandoned": abandoned,
+            "created_at": created_at,
+            "updated_at": updated_at,
+        })
+
+    # 4. Seed allotments
+    allotments_raw = []
+    for k in range(20):
+        mode = rng.choice(["PROGRESSIVE", "PREDICTIVE"])
+        approved = rng.randint(5, 50)
+        remaining = rng.randint(0, approved)
+        expires_at = now + rng.uniform(-100.0, 100.0)
+        conn.execute(
+            """
+            INSERT INTO safety_allotments (campaign_id, mode, approved, remaining, created_at, expires_at)
+            VALUES ('default', ?, ?, ?, ?, ?);
+            """,
+            (mode, approved, remaining, now - 10.0, expires_at),
+        )
+        allotments_raw.append({
+            "mode": mode,
+            "approved": approved,
+            "remaining": remaining,
+            "expires_at": expires_at,
+        })
+
+    # Run read_snapshot
+    snap = read_snapshot(conn, now, short_w, long_w, abandon_w)
+
+    # Brute-force verification in pure Python
+    bf_agent_counts = {st.value: 0 for st in AgentState}
+    for ag in agents_raw:
+        bf_agent_counts[ag["state"]] += 1
+
+    assert snap.agents_by_state == bf_agent_counts
+    assert snap.available == bf_agent_counts[AgentState.AVAILABLE.value]
+    assert snap.wrap_up == bf_agent_counts[AgentState.WRAP_UP.value]
+    assert snap.connected == bf_agent_counts[AgentState.CONNECTED.value]
+    bf_online = sum(cnt for st_val, cnt in bf_agent_counts.items() if st_val not in (AgentState.OFFLINE.value, AgentState.PAUSED.value))
+    assert snap.online == bf_online
+
+    # Call tallies
+    bf_unbound_in_flight = sum(1 for c in calls_raw if c["agent_id"] is None and c["state"] in ("RESERVED", "INITIATED", "RINGING"))
+    bf_ringing_unbound = sum(1 for c in calls_raw if c["agent_id"] is None and c["state"] == "RINGING")
+    bf_unanswered_unbound = bf_unbound_in_flight
+    bf_bound_in_flight = sum(1 for c in calls_raw if c["agent_id"] is not None and c["state"] in ("RESERVED", "INITIATED", "RINGING"))
+    bf_answered_waiting = sum(1 for c in calls_raw if c["agent_id"] is None and c["state"] in ("ANSWERED", "CONNECTED") and c["abandoned"] == 0)
+
+    assert snap.unbound_in_flight == bf_unbound_in_flight
+    assert snap.ringing_unbound == bf_ringing_unbound
+    assert snap.unanswered_unbound == bf_unanswered_unbound
+    assert snap.bound_in_flight == bf_bound_in_flight
+    assert snap.answered_waiting == bf_answered_waiting
+
+    # Pending allotments
+    bf_pend_prog = sum(a["remaining"] for a in allotments_raw if a["mode"] == "PROGRESSIVE" and a["expires_at"] > now)
+    bf_pend_pred = sum(a["remaining"] for a in allotments_raw if a["mode"] == "PREDICTIVE" and a["expires_at"] > now)
+    assert snap.pending_progressive == bf_pend_prog
+    assert snap.pending_predictive == bf_pend_pred
+
+    # RateStats
+    def bf_rate_stats(window_s):
+        cutoff = now - window_s
+        ans = sum(1 for c in calls_raw if c["created_at"] >= cutoff and c["state_rank"] >= 2 and c["answered_at"] is not None)
+        no_ans = sum(1 for c in calls_raw if c["created_at"] >= cutoff and c["state_rank"] >= 2 and c["answered_at"] is None and c["end_reason"] == "NO_ANSWER")
+        return ans, ans + no_ans
+
+    short_ans, short_res = bf_rate_stats(short_w)
+    long_ans, long_res = bf_rate_stats(long_w)
+    assert snap.short.answered == short_ans
+    assert snap.short.resolved == short_res
+    assert snap.long.answered == long_ans
+    assert snap.long.resolved == long_res
+
+    # AbandonStats
+    ab_cutoff = now - abandon_w
+    bf_ab_ans = sum(1 for c in calls_raw if c["answered_at"] is not None and c["answered_at"] >= ab_cutoff)
+    bf_ab_cnt = sum(1 for c in calls_raw if c["answered_at"] is not None and c["answered_at"] >= ab_cutoff and c["abandoned"] == 1)
+    assert snap.abandon.answered == bf_ab_ans
+    assert snap.abandon.abandoned == bf_ab_cnt
+
+    # avg_talk_s
+    talk_cutoff = now - long_w
+    talk_diffs = [
+        c["updated_at"] - c["answered_at"]
+        for c in calls_raw
+        if c["state"] == "COMPLETED" and c["answered_at"] is not None and c["answered_at"] >= talk_cutoff
+    ]
+    if talk_diffs:
+        bf_avg_talk = sum(talk_diffs) / len(talk_diffs)
+        assert snap.avg_talk_s is not None
+        assert abs(snap.avg_talk_s - bf_avg_talk) < 1e-4
+    else:
+        assert snap.avg_talk_s is None

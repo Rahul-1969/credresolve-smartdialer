@@ -62,31 +62,44 @@ def process_actions(
 
     # 1. Atomic batch claim in a single short transaction
     with transaction(conn):
-        cur = conn.execute(
+        cur_cand = conn.execute(
             """
-            UPDATE call_actions
-            SET claimed_by = ?,
-                claim_expires_at = ?,
-                attempts = attempts + 1
-            WHERE id IN (
-                SELECT id FROM call_actions
-                WHERE done_at IS NULL
+            SELECT id FROM call_actions
+            WHERE done_at IS NULL
+              AND attempts < ?
+              AND (claimed_by IS NULL OR claim_expires_at <= ?)
+            ORDER BY id ASC
+            LIMIT ?;
+            """,
+            (config.action_max_attempts, now, limit),
+        )
+        cand_ids = [row["id"] for row in cur_cand.fetchall()]
+        claimed_rows = []
+
+        for act_id in cand_ids:
+            cur_up = conn.execute(
+                """
+                UPDATE call_actions
+                SET claimed_by = ?,
+                    claim_expires_at = ?,
+                    attempts = attempts + 1
+                WHERE id = ?
+                  AND done_at IS NULL
                   AND attempts < ?
                   AND (claimed_by IS NULL OR claim_expires_at <= ?)
-                ORDER BY id ASC
-                LIMIT ?
+                RETURNING id, call_id, action, reason, attempts;
+                """,
+                (
+                    worker_id,
+                    now + config.action_claim_lease_s,
+                    act_id,
+                    config.action_max_attempts,
+                    now,
+                ),
             )
-            RETURNING id, call_id, action, reason, attempts;
-            """,
-            (
-                worker_id,
-                now + config.action_claim_lease_s,
-                config.action_max_attempts,
-                now,
-                limit,
-            ),
-        )
-        claimed_rows = cur.fetchall()
+            r = cur_up.fetchone()
+            if r is not None:
+                claimed_rows.append(r)
 
     counts["claimed"] = len(claimed_rows)
     if not claimed_rows:

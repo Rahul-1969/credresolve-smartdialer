@@ -164,6 +164,15 @@ def init_schema(conn: sqlite3.Connection) -> None:
         ON call_actions(done_at, attempts, claimed_by, claim_expires_at);
         """,
         """
+        CREATE INDEX IF NOT EXISTS idx_calls_active
+        ON calls(agent_id, state)
+        WHERE state NOT IN ('COMPLETED','FAILED','CANCELLED');
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_calls_state_answered
+        ON calls(state, answered_at);
+        """,
+        """
         CREATE INDEX IF NOT EXISTS idx_calls_state_agent
         ON calls(state, agent_id);
         """,
