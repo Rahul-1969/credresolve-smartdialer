@@ -1,5 +1,7 @@
 # SmartDialer Performance and Load Test Report
 
+Measured on a shared development machine with background processes running; absolute numbers vary by several times between runs. Use these results for relative comparison.
+
 **Execution Mode**: Full
 **Python Version**: 3.11.9
 **Platform**: Windows-10-10.0.26300-SP0 (AMD64)
@@ -55,7 +57,7 @@
 > **Measured Root Cause of Pool-Size Slowdown & Query-Plan Optimization**:
 > Analysis of SQLite's `EXPLAIN QUERY PLAN` revealed that the legacy dispatch construct (`UPDATE ... WHERE id IN (SELECT id ... LIMIT ?) AND state = ...`) caused SQLite to choose `SEARCH ... USING INDEX idx_*_state (state=?)` for the outer UPDATE statement. This forced SQLite to scan every single AVAILABLE agent (10,000 rows) and QUEUED borrower (20,000 rows) to probe the `IN` list on every dispatch attempt — an O(N pool size) full-index scan.
 >
-> Rewriting `claim_borrowers` and `reserve_agents` to first select candidate IDs via index range seek (`LIMIT ?`) and then update each candidate by Primary Key (`WHERE id = ? AND state = ...`) forces SQLite to execute a logarithmic point seek (`SEARCH USING INDEX sqlite_autoindex_*_1 (id=?)`), completely eliminating the O(N) pool scan and accelerating single-thread 10k-pool dispatch from 152.7 ops/sec to 790.4+ ops/sec (over 5x speedup).
+> Rewriting `claim_borrowers` and `reserve_agents` to first select candidate IDs via index range seek (`LIMIT ?`) and then update each candidate by Primary Key (`WHERE id = ? AND state = ...`) forces SQLite to execute a logarithmic point seek (`SEARCH USING INDEX sqlite_autoindex_*_1 (id=?)`), completely eliminating the O(N) pool scan (about 5x faster in an isolated single-thread 10,000-agent benchmark; the harness table below was measured on a busy machine and shows lower absolute numbers).
 
 - **Agent Pool**: 10,000
 - **Borrower Pool**: 20,000
@@ -95,7 +97,7 @@
 ## 5. Telemetry Snapshot Latency (`read_snapshot`) & Index Optimization
 > [!TIP]
 > **Why `idx_calls_answered_at` index optimizes telemetry queries**:
-> `read_snapshot` computes abandon rate by querying `SELECT COUNT(*), SUM(CASE WHEN abandoned = 1 THEN 1 ELSE 0 END) FROM calls WHERE answered_at >= ?;`. Without an index on `answered_at`, SQLite must perform an unindexed full table scan (`SCAN calls`), which scales linearly with the total call history (O(N)). Adding `CREATE INDEX idx_calls_answered_at ON calls(answered_at)` replaces the table scan with a logarithmic range search (`SEARCH calls USING INDEX idx_calls_answered_at (answered_at>?)`), ensuring snapshot latency stays under 15 ms even with 100,000+ historical calls.
+> `read_snapshot` computes abandon rate by querying `SELECT COUNT(*), SUM(CASE WHEN abandoned = 1 THEN 1 ELSE 0 END) FROM calls WHERE answered_at >= ?;`. Without an index on `answered_at`, SQLite must perform an unindexed full table scan (`SCAN calls`), which scales linearly with the total call history (O(N)). Adding `CREATE INDEX idx_calls_answered_at ON calls(answered_at)` replaces the table scan with a logarithmic range search (`SEARCH calls USING INDEX idx_calls_answered_at (answered_at>?)`). At 100,000 calls the snapshot still costs roughly 120–350 ms, because the windowed answer-rate and abandon queries scan every call inside their window.
 
 | Agents | Calls Table Rows | p50 Latency (ms) | p95 Latency (ms) | Max Latency (ms) |
 |---|---|---|---|---|

@@ -789,6 +789,7 @@ def build_loadtest_markdown(
     """Format load test results into a comprehensive Markdown document."""
     lines = []
     lines.append("# SmartDialer Performance and Load Test Report\n")
+    lines.append("Measured on a shared development machine with background processes running; absolute numbers vary by several times between runs. Use these results for relative comparison.\n")
     lines.append(f"**Execution Mode**: {'Quick (--quick)' if quick else 'Full'}")
     lines.append(f"**Python Version**: {sys.version.split()[0]}")
     lines.append(f"**Platform**: {platform.platform()} ({platform.machine()})")
@@ -849,7 +850,7 @@ def build_loadtest_markdown(
         ">\n"
         "> Rewriting `claim_borrowers` and `reserve_agents` to first select candidate IDs via index range seek (`LIMIT ?`) and then update each candidate by Primary Key "
         "(`WHERE id = ? AND state = ...`) forces SQLite to execute a logarithmic point seek (`SEARCH USING INDEX sqlite_autoindex_*_1 (id=?)`), completely eliminating "
-        "the O(N) pool scan and accelerating single-thread 10k-pool dispatch from 152.7 ops/sec to 790.4+ ops/sec (over 5x speedup).\n"
+        "the O(N) pool scan (about 5x faster in an isolated single-thread 10,000-agent benchmark; the harness table below was measured on a busy machine and shows lower absolute numbers).\n"
     )
     lines.append(f"- **Agent Pool**: {breakdown_results['agents']:,}")
     lines.append(f"- **Borrower Pool**: {breakdown_results['borrowers']:,}")
@@ -878,8 +879,8 @@ def build_loadtest_markdown(
         "> **Why `idx_calls_answered_at` index optimizes telemetry queries**:\n"
         "> `read_snapshot` computes abandon rate by querying `SELECT COUNT(*), SUM(CASE WHEN abandoned = 1 THEN 1 ELSE 0 END) FROM calls WHERE answered_at >= ?;`. "
         "Without an index on `answered_at`, SQLite must perform an unindexed full table scan (`SCAN calls`), which scales linearly with the total call history (O(N)). "
-        "Adding `CREATE INDEX idx_calls_answered_at ON calls(answered_at)` replaces the table scan with a logarithmic range search (`SEARCH calls USING INDEX idx_calls_answered_at (answered_at>?)`), "
-        "ensuring snapshot latency stays under 15 ms even with 100,000+ historical calls.\n"
+        "Adding `CREATE INDEX idx_calls_answered_at ON calls(answered_at)` replaces the table scan with a logarithmic range search (`SEARCH calls USING INDEX idx_calls_answered_at (answered_at>?)`). "
+        "At 100,000 calls the snapshot still costs roughly 120–350 ms, because the windowed answer-rate and abandon queries scan every call inside their window.\n"
     )
     lines.append("| Agents | Calls Table Rows | p50 Latency (ms) | p95 Latency (ms) | Max Latency (ms) |")
     lines.append("|---|---|---|---|---|")
