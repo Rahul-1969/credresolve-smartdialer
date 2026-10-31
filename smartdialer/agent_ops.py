@@ -56,7 +56,7 @@ def agent_went_offline(
 
                 if call_rank >= 4:
                     conn.execute(
-                        "UPDATE calls SET abandoned = 1, updated_at = ? WHERE id = ?;",
+                        "UPDATE calls SET agent_id = NULL, abandoned = 1, updated_at = ? WHERE id = ?;",
                         (now, call_id),
                     )
                     conn.execute(
@@ -72,6 +72,10 @@ def agent_went_offline(
                     call_repo.apply_event(call_id, CallState.CANCELLED, reason="AGENT_LOST", now=now)
                     action_taken = "cancelled_directly"
                 else:
+                    conn.execute(
+                        "UPDATE calls SET agent_id = NULL, updated_at = ? WHERE id = ?;",
+                        (now, call_id),
+                    )
                     conn.execute(
                         """
                         INSERT INTO call_actions (call_id, action, reason, created_at)

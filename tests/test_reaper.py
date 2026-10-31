@@ -237,3 +237,134 @@ def test_13_terminate_dead_letter_recovered_by_reaper():
     assert c_after["state"] == "COMPLETED"
     assert c_after["end_reason"] == "ABANDONED"
 
+
+def test_reaper_live_call_throttled_query_frequency():
+    """0.3 Live long call is queried exactly once across 10 sweeps within one timeout window."""
+    conn = connect(":memory:")
+    init_schema(conn)
+    cfg = Config(stuck_call_timeout_s=90.0)
+
+    now = 100.0
+    rng = random.Random(42)
+    behavior = BorrowerBehavior(answer_rate=1.0, mean_talk_s=1000.0)
+    profile = ProviderProfile(setup_latency_s=0.1, latency_jitter_s=0.0, error_rate=0.0, timeout_rate=0.0)
+    mock = MockProvider("prov_live", profile, behavior, rng)
+
+    class CountingProviderWrapper:
+        def __init__(self, inner: MockProvider):
+            self.inner = inner
+            self.query_counts: dict[str, int] = {}
+
+        def get_call_status(self, call_id: str, t: float) -> str | None:
+            self.query_counts[call_id] = self.query_counts.get(call_id, 0) + 1
+            return self.inner.get_call_status(call_id, t)
+
+        def place_call(self, call_id: str, phone: str, t: float):
+            return self.inner.place_call(call_id, phone, t)
+
+        def cancel_call(self, call_id: str, t: float) -> bool:
+            return self.inner.cancel_call(call_id, t)
+
+        def terminate_call(self, call_id: str, t: float) -> bool:
+            return self.inner.terminate_call(call_id, t)
+
+        def poll_events(self, t: float):
+            return self.inner.poll_events(t)
+
+        @property
+        def name(self) -> str:
+            return self.inner.name
+
+    wrapper = CountingProviderWrapper(mock)
+    providers = {"prov_live": wrapper}
+
+    # Place call at provider so provider reports live (e.g. ANSWERED)
+    mock.place_call("c_long", "+18005550099", now=now)
+
+    # Seed borrower and call in DB
+    conn.execute(
+        "INSERT INTO borrowers (id, phone, state, updated_at) VALUES ('b_long', '+18005550099', 'IN_CALL', ?);",
+        (now,),
+    )
+    # Call is in ANSWERED with updated_at = now - 95.0 (> 90.0s ago)
+    conn.execute(
+        "INSERT INTO calls (id, borrower_id, provider, state, state_rank, version, created_at, updated_at) "
+        "VALUES ('c_long', 'b_long', 'prov_live', 'ANSWERED', 4, 1, ?, ?);",
+        (now - 100.0, now - 95.0),
+    )
+
+    reaper = Reaper(conn, cfg, providers)  # type: ignore
+
+    # Run 10 sweeps within a 45-second window (all within the 90s stuck_call_timeout_s window)
+    for step in range(10):
+        t = now + step * 5.0
+        reaper.sweep(t)
+
+    # The call should have been queried on the FIRST sweep, updating its updated_at,
+    # and skipped on the remaining 9 sweeps
+    assert wrapper.query_counts.get("c_long", 0) == 1
+
+    # Check version was NOT touched
+    c_row = conn.execute("SELECT version, updated_at, state FROM calls WHERE id = 'c_long';").fetchone()
+    assert c_row["version"] == 1
+    assert c_row["updated_at"] == now
+    assert c_row["state"] == "ANSWERED"
+
+
+def test_reaper_reconciles_dropped_completed_frees_connected_agent():
+    """0.4 Reconcile a dropped COMPLETED for a CONNECTED call: sweep frees agent into WRAP_UP."""
+    conn = connect(":memory:")
+    init_schema(conn)
+    cfg = Config(stuck_call_timeout_s=60.0)
+
+    now = 100.0
+    rng = random.Random(42)
+    behavior = BorrowerBehavior(answer_rate=1.0, mean_talk_s=30.0)
+    profile = ProviderProfile(setup_latency_s=0.1, latency_jitter_s=0.0, error_rate=0.0, timeout_rate=0.0)
+    mock = MockProvider("prov_drop", profile, behavior, rng)
+    providers = {"prov_drop": mock}
+
+    # Place call at provider
+    mock.place_call("c_stuck_conn", "+18005550088", now=now)
+
+    # Outage on prov_drop that drops events during completion (t=110 to t=160)
+    mock.inject_outage(start=now + 5.0, end=now + 60.0, mode="error", events="drop")
+
+    # In DB: call is CONNECTED, agent is CONNECTED, borrower is IN_CALL
+    conn.execute(
+        "INSERT INTO agents (id, state, reserved_call_id, updated_at) "
+        "VALUES ('a_conn_stuck', 'CONNECTED', 'c_stuck_conn', ?);",
+        (now,),
+    )
+    conn.execute(
+        "INSERT INTO borrowers (id, phone, state, updated_at) "
+        "VALUES ('b_conn_stuck', '+18005550088', 'IN_CALL', ?);",
+        (now,),
+    )
+    conn.execute(
+        "INSERT INTO calls (id, borrower_id, agent_id, provider, state, state_rank, created_at, updated_at) "
+        "VALUES ('c_stuck_conn', 'b_conn_stuck', 'a_conn_stuck', 'prov_drop', 'CONNECTED', 5, ?, ?);",
+        (now, now),
+    )
+
+    # Advance time past completion and stuck_call_timeout_s: now + 120s
+    later = now + 120.0
+    # Provider ground truth has completed
+    assert mock.get_call_status("c_stuck_conn", later) == "COMPLETED"
+
+    reaper = Reaper(conn, cfg, providers)
+    sweep_res = reaper.sweep(later)
+    assert sweep_res["reconciled_stuck"] == 1
+
+    # Verify agent was freed from CONNECTED to WRAP_UP
+    ag = conn.execute("SELECT state, reserved_call_id FROM agents WHERE id = 'a_conn_stuck';").fetchone()
+    assert ag["state"] == AgentState.WRAP_UP.value
+    assert ag["reserved_call_id"] == "c_stuck_conn"
+
+    # Verify call state is COMPLETED and borrower is DONE
+    c = conn.execute("SELECT state, end_reason FROM calls WHERE id = 'c_stuck_conn';").fetchone()
+    assert c["state"] == "COMPLETED"
+
+    b = conn.execute("SELECT state FROM borrowers WHERE id = 'b_conn_stuck';").fetchone()
+    assert b["state"] == BorrowerState.DONE.value
+

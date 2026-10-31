@@ -174,7 +174,12 @@ class Reaper:
                 counts["reconciled_stuck"] += 1
 
             else:
-                # Call is still active at provider
+                # Call is still active at provider: touch updated_at without changing version
+                with transaction(self.conn):
+                    self.conn.execute(
+                        "UPDATE calls SET updated_at = ? WHERE id = ?;",
+                        (now, call_id),
+                    )
                 if is_abandoned:
                     # Re-enqueue terminate action (idempotent ON CONFLICT)
                     enqueue_action(self.conn, call_id, "TERMINATE", "ABANDONED", now)

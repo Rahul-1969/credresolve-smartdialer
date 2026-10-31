@@ -17,6 +17,12 @@ FORBIDDEN_PACING_MODULES = {
     "smartdialer.repo",
     "smartdialer.db",
     "smartdialer.metrics",
+    "importlib",
+    "builtins",
+    "runpy",
+    "pkgutil",
+    "imp",
+    "ctypes",
 }
 
 ALLOWED_SMARTDIALER_ROOTS = {
@@ -39,17 +45,6 @@ def get_imports_from_ast(tree: ast.AST) -> list[str]:
             if node.module:
                 imports.append(node.module)
     return imports
-
-
-FORBIDDEN_PACING_NAMES = {
-    "importlib",
-    "__import__",
-    "exec",
-    "eval",
-    "compile",
-    "open",
-    "sys.modules",
-}
 
 
 def validate_pacing_ast(source: str, filename: str = "<string>") -> None:
@@ -168,20 +163,50 @@ def test_safety_config_invariants():
 
 def test_architecture_checker_fails_on_synthetic_violations():
     """Synthetic check: import validator detects violations and cannot pass vacuously."""
-    # 1. Detect forbidden import
-    synthetic_code = "import smartdialer.safety\n"
+    # 1. Base forbidden imports
     with pytest.raises(AssertionError, match="Forbidden import 'smartdialer.safety'"):
-        validate_pacing_imports(synthetic_code, "synthetic_fail.py")
+        validate_pacing_imports("import smartdialer.safety\n", "synthetic_fail.py")
 
-    synthetic_db = "import sqlite3\n"
     with pytest.raises(AssertionError, match="Forbidden import 'sqlite3'"):
-        validate_pacing_imports(synthetic_db, "synthetic_fail.py")
+        validate_pacing_imports("import sqlite3\n", "synthetic_fail.py")
 
-    # 2. Detect forbidden identifier
-    synthetic_id = "def bypass(): pass\n"
-    with pytest.raises(AssertionError, match="Forbidden safety bypass identifiers"):
-        validate_safety_identifiers(synthetic_id, "synthetic_fail.py")
+    # 2. Specific synthetic cases requested in Task 9 Part 0.1
+    with pytest.raises(AssertionError):
+        validate_pacing_imports("import importlib\n", "case1.py")
 
-    synthetic_enable = "enabled = True\n"
+    with pytest.raises(AssertionError):
+        validate_pacing_imports("from importlib import import_module\n", "case2.py")
+
+    with pytest.raises(AssertionError):
+        validate_pacing_imports('__import__("x")\n', "case3.py")
+
+    with pytest.raises(AssertionError):
+        validate_pacing_imports('exec("1")\n', "case4.py")
+
+    with pytest.raises(AssertionError):
+        validate_pacing_imports('eval("1")\n', "case5.py")
+
+    with pytest.raises(AssertionError):
+        validate_pacing_imports('compile("1", "f", "eval")\n', "case6.py")
+
+    with pytest.raises(AssertionError):
+        validate_pacing_imports('open("f")\n', "case7.py")
+
+    with pytest.raises(AssertionError):
+        validate_pacing_imports("import sys\nx = sys.modules\n", "case8.py")
+
+    with pytest.raises(AssertionError):
+        validate_pacing_imports("from .. import safety\n", "case9.py")
+
+    with pytest.raises(AssertionError):
+        validate_pacing_imports("from smartdialer.dialer import Dialer\n", "case10.py")
+
+    with pytest.raises(AssertionError):
+        validate_pacing_imports("from smartdialer.providers.base import TelecomProvider\n", "case11.py")
+
+    # 3. Detect forbidden safety identifiers
     with pytest.raises(AssertionError, match="Forbidden safety bypass identifiers"):
-        validate_safety_identifiers(synthetic_enable, "synthetic_fail.py")
+        validate_safety_identifiers("def bypass(): pass\n", "synthetic_fail.py")
+
+    with pytest.raises(AssertionError, match="Forbidden safety bypass identifiers"):
+        validate_safety_identifiers("enabled = True\n", "synthetic_fail.py")

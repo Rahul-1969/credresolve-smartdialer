@@ -95,7 +95,7 @@ class Dialer:
         if decision.cancel_excess > 0:
             cur = self.conn.execute(
                 """
-                SELECT c.id, c.state, c.provider_call_id
+                SELECT c.id, c.state, c.provider_call_id, c.provider
                 FROM calls c
                 WHERE c.agent_id IS NULL
                   AND c.state IN ('RESERVED', 'INITIATED', 'RINGING')
@@ -115,6 +115,8 @@ class Dialer:
                 prov_call_id = row["provider_call_id"]
                 if c_state == CallState.RESERVED.value and prov_call_id is None:
                     call_repo.apply_event(cid, CallState.CANCELLED, reason="CAPACITY_EXCESS", now=now)
+                    if row["provider"]:
+                        enqueue_action(self.conn, cid, "CANCEL", "CAPACITY_EXCESS", now)
                 else:
                     enqueue_action(self.conn, cid, "CANCEL", "CAPACITY_EXCESS", now)
                 cancel_enqueued += 1
@@ -246,6 +248,10 @@ class Dialer:
             now,
         )
 
+        rationale = dict(request.rationale)
+        if "p_hi" in decision.inputs:
+            rationale["p_hi"] = decision.inputs["p_hi"]
+
         return TickReport(
             now=now,
             requested=request.requested_calls,
@@ -262,5 +268,5 @@ class Dialer:
             cancel_enqueued=cancel_enqueued,
             events=event_tallies,
             actions=action_report,
-            pacing_rationale=request.rationale,
+            pacing_rationale=rationale,
         )

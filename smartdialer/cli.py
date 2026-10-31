@@ -2,10 +2,11 @@
 
 Single Responsibility:
     Provide CLI entrypoints and argument parsing for database initialization,
-    campaign simulation, and load testing.
+    operational failure scenarios, campaign simulation, and load testing.
 """
 
 import argparse
+from pathlib import Path
 import sys
 
 from smartdialer.db import connect, init_schema
@@ -27,15 +28,69 @@ def cmd_init_db(args: argparse.Namespace) -> int:
         conn.close()
 
 
+def cmd_scenarios(args: argparse.Namespace) -> int:
+    """Run operational failure scenarios."""
+    target = getattr(args, "name", "all") or "all"
+    target = target.lower()
+
+    from smartdialer.scenarios import (
+        run_all_scenarios,
+        run_scenario_agent_drop,
+        run_scenario_duplicate_events,
+        run_scenario_out_of_order_events,
+        run_scenario_provider_outage,
+        run_scenario_worker_crash,
+    )
+
+    if target in ("worker_crash", "s1"):
+        run_scenario_worker_crash(print_report=True)
+    elif target in ("provider_outage", "s2"):
+        run_scenario_provider_outage(print_report=True)
+    elif target in ("agent_drop", "s3"):
+        run_scenario_agent_drop(print_report=True)
+    elif target in ("duplicate_events", "s4"):
+        run_scenario_duplicate_events(print_report=True)
+    elif target in ("out_of_order_events", "s5"):
+        run_scenario_out_of_order_events(print_report=True)
+    elif target in ("all", ""):
+        run_all_scenarios(print_reports=True)
+    else:
+        print(
+            f"Unknown scenario: {target}. Available: worker_crash, provider_outage, "
+            "agent_drop, duplicate_events, out_of_order_events, all"
+        )
+        return 1
+    return 0
+
+
 def cmd_simulate(args: argparse.Namespace) -> int:
-    """Run dialer simulation across test scenarios."""
-    print("not implemented yet")
+    """Run dialer campaign simulation across scenarios."""
+    from smartdialer.simulator import run_full_suite
+
+    scenarios_arg = getattr(args, "scenarios", "A,B,C,D") or "A,B,C,D"
+    sc_list = [s.strip().upper() for s in scenarios_arg.split(",") if s.strip()]
+    agents = getattr(args, "agents", 50)
+    duration = getattr(args, "duration", 1200)
+    seed = getattr(args, "seed", 7)
+    out_dir = getattr(args, "out", "docs")
+
+    run_full_suite(
+        scenarios=sc_list,
+        agents=agents,
+        duration=duration,
+        seed=seed,
+        out_dir=out_dir,
+        print_markdown=True,
+    )
     return 0
 
 
 def cmd_loadtest(args: argparse.Namespace) -> int:
-    """Run dialer load tests."""
-    print("not implemented yet")
+    """Run dialer performance and load tests."""
+    from smartdialer.loadtest import run_load_test
+
+    quick = getattr(args, "quick", False)
+    run_load_test(quick=quick, out_dir="docs", print_markdown=True)
     return 0
 
 
@@ -47,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
 
+    # init-db
     init_db_parser = subparsers.add_parser("init-db", help="Initialize the database")
     init_db_parser.add_argument(
         "--db",
@@ -55,10 +111,55 @@ def main(argv: list[str] | None = None) -> int:
     )
     init_db_parser.set_defaults(func=cmd_init_db)
 
+    # scenarios
+    scenarios_parser = subparsers.add_parser("scenarios", help="Run operational failure scenarios")
+    scenarios_parser.add_argument(
+        "name",
+        nargs="?",
+        default="all",
+        help="Scenario name: worker_crash, provider_outage, agent_drop, duplicate_events, out_of_order_events, all",
+    )
+    scenarios_parser.set_defaults(func=cmd_scenarios)
+
+    # simulate
     simulate_parser = subparsers.add_parser("simulate", help="Run campaign simulation")
+    simulate_parser.add_argument(
+        "--scenarios",
+        default="A,B,C,D",
+        help="Comma-separated scenarios to run (default: A,B,C,D)",
+    )
+    simulate_parser.add_argument(
+        "--agents",
+        type=int,
+        default=50,
+        help="Number of simulated agents (default: 50)",
+    )
+    simulate_parser.add_argument(
+        "--duration",
+        type=int,
+        default=1200,
+        help="Duration in virtual seconds (default: 1200)",
+    )
+    simulate_parser.add_argument(
+        "--seed",
+        type=int,
+        default=7,
+        help="RNG seed (default: 7)",
+    )
+    simulate_parser.add_argument(
+        "--out",
+        default="docs",
+        help="Output directory for generated results (default: docs)",
+    )
     simulate_parser.set_defaults(func=cmd_simulate)
 
+    # loadtest
     loadtest_parser = subparsers.add_parser("loadtest", help="Run dialer load tests")
+    loadtest_parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Run quick load test with smaller pools (under 30 seconds)",
+    )
     loadtest_parser.set_defaults(func=cmd_loadtest)
 
     args = parser.parse_args(argv)

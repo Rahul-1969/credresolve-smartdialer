@@ -6,7 +6,7 @@ import pytest
 
 from smartdialer.actions import process_actions
 from smartdialer.agent_ops import agent_went_offline
-from smartdialer.calls import CallState
+from smartdialer.calls import ApplyResult, CallState
 from smartdialer.config import Config
 from smartdialer.db import connect, init_schema
 from smartdialer.models import AgentState, BorrowerState
@@ -363,4 +363,31 @@ def test_15_part1_guards_and_predictive_zero_talk():
     req = pacer.propose(snap)
     assert req.requested_calls >= 0
     assert req.rationale["talk"] == 1.0
+
+    # 4. Part 2.2: Bound call whose agent is gone rebinds or abandons on ANSWERED/CONNECTED
+    # Seed an available replacement agent
+    conn.execute(
+        "INSERT INTO agents (id, state, updated_at) VALUES ('a_rep_15', 'AVAILABLE', ?);",
+        (now,),
+    )
+    # Agent a_gone is already OFFLINE and unlinked
+    conn.execute(
+        "INSERT INTO agents (id, state, reserved_call_id, updated_at) VALUES ('a_gone', 'OFFLINE', NULL, ?);",
+        (now,),
+    )
+    conn.execute(
+        "INSERT INTO borrowers (id, phone, state, attempts, updated_at) VALUES ('b_p22', '+1010', 'IN_CALL', 0, ?);",
+        (now,),
+    )
+    conn.execute(
+        "INSERT INTO calls (id, borrower_id, agent_id, state, state_rank, created_at, updated_at) "
+        "VALUES ('c_p22', 'b_p22', 'a_gone', 'RINGING', 3, ?, ?);",
+        (now, now),
+    )
+    call_repo = CallRepo(conn, cfg)
+    res_p22 = call_repo.apply_event("c_p22", CallState.ANSWERED, now=now + 2.0)
+    assert res_p22 == ApplyResult.APPLIED
+    c_p22 = call_repo.get_call("c_p22")
+    assert c_p22["agent_id"] == "a_rep_15"
+    assert c_p22["abandoned"] == 0
 
