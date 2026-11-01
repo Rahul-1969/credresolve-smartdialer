@@ -74,14 +74,18 @@ def cmd_simulate(args: argparse.Namespace) -> int:
     seed = getattr(args, "seed", 7)
     out_dir = getattr(args, "out", "docs")
 
-    run_full_suite(
-        scenarios=sc_list,
-        agents=agents,
-        duration=duration,
-        seed=seed,
-        out_dir=out_dir,
-        print_markdown=True,
-    )
+    try:
+        run_full_suite(
+            scenarios=sc_list,
+            agents=agents,
+            duration=duration,
+            seed=seed,
+            out_dir=out_dir,
+            print_markdown=True,
+        )
+    except AssertionError as exc:
+        print(f"Self-check failed: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -90,7 +94,9 @@ def cmd_loadtest(args: argparse.Namespace) -> int:
     from smartdialer.loadtest import run_load_test
 
     quick = getattr(args, "quick", False)
-    run_load_test(quick=quick, out_dir="docs", print_markdown=True)
+    default_out = "results_quick/loadtest_results_quick.md" if quick else "docs/loadtest_results.md"
+    out_path = getattr(args, "out", None) or default_out
+    run_load_test(quick=quick, out_path=out_path, print_markdown=True)
     return 0
 
 
@@ -160,6 +166,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run quick load test with smaller pools (under 30 seconds)",
     )
+    loadtest_parser.add_argument(
+        "--out",
+        default=None,
+        help="Output path for generated markdown report (default: docs/loadtest_results.md or results_quick/loadtest_results_quick.md if --quick)",
+    )
     loadtest_parser.set_defaults(func=cmd_loadtest)
 
     args = parser.parse_args(argv)
@@ -168,7 +179,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 1
 
-    return args.func(args)
+    try:
+        return args.func(args)
+    except AssertionError as exc:
+        print(f"Self-check failed: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

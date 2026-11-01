@@ -704,10 +704,11 @@ def benchmark_concurrent_safety(
 
 def run_load_test(
     quick: bool = False,
-    out_dir: str | Path = "docs",
+    out_path: str | Path | None = None,
+    out_dir: str | Path | None = None,
     print_markdown: bool = True,
 ) -> dict[str, Any]:
-    """Execute complete load testing suite and generate docs/loadtest_results.md."""
+    """Execute complete load testing suite and generate markdown report."""
     if quick:
         dispatch_agents = [100, 500]
         dispatch_threads = [1, 4]
@@ -751,9 +752,22 @@ def run_load_test(
         quick=quick,
     )
 
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    md_file = out_path / "loadtest_results.md"
+    if out_path is not None:
+        target = Path(out_path)
+        if target.suffix == ".md":
+            target.parent.mkdir(parents=True, exist_ok=True)
+            md_file = target
+        else:
+            target.mkdir(parents=True, exist_ok=True)
+            md_file = target / "loadtest_results.md"
+    elif out_dir is not None:
+        target = Path(out_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        md_file = target / "loadtest_results.md"
+    else:
+        md_file = Path("results_quick/loadtest_results_quick.md") if quick else Path("docs/loadtest_results.md")
+        md_file.parent.mkdir(parents=True, exist_ok=True)
+
     with open(md_file, "w", encoding="utf-8") as f:
         f.write(md_content)
 
@@ -797,16 +811,6 @@ def build_loadtest_markdown(
     lines.append(f"**Command**: `python -m smartdialer.cli loadtest {'--quick' if quick else ''}`\n")
 
     lines.append("## 1. Dispatch Throughput (`dispatch.start_progressive_call`)")
-    lines.append(
-        "> [!NOTE]\n"
-        "> **Attempt Distribution & 96 / 992 Truncation Root Cause**:\n"
-        "> Previously, worker thread attempts were computed using integer division without remainder distribution: "
-        "`attempts_per_thread = n_agents // n_threads`. When `n_agents = 100` and `n_threads = 8`, `100 // 8 = 12`, so "
-        "8 threads attempted 12 calls each = 96 total attempts. For `n_threads = 16`, `100 // 16 = 6 * 16 = 96`. For "
-        "`n_agents = 1000` and `n_threads = 16`, `1000 // 16 = 62 * 16 = 992`. "
-        "The harness has been fixed to distribute remainder evenly via `(n_agents // n_threads) + (1 if tid < n_agents % n_threads else 0)`, "
-        "ensuring total attempted calls exactly match the agent pool size.\n"
-    )
     lines.append("| Agent Pool | Threads | Attempted | Reserved | Errors | Ops / Sec | Elapsed (s) | First Error |")
     lines.append("|---|---|---|---|---|---|---|---|")
     for r in dispatch_results:
@@ -840,7 +844,7 @@ def build_loadtest_markdown(
     for r in writer_results:
         lines.append(f"| {r['agents']:,} | {r['calls']:,} | {r['iterations']} | **{r['p50_ms']:.3f} ms** | {r['p95_ms']:.3f} ms | {r['max_ms']:.3f} ms |")
 
-    lines.append("\n## 4. Single-Thread Dispatch Statement Breakdown at 10,000 Agents")
+    lines.append(f"\n## 4. Single-Thread Dispatch Statement Breakdown at {breakdown_results['agents']:,} Agents")
     lines.append(
         "> [!NOTE]\n"
         "> **Measured Root Cause of Pool-Size Slowdown & Query-Plan Optimization**:\n"
