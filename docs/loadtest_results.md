@@ -2,11 +2,11 @@
 
 Measured on a shared development machine with background processes running; absolute numbers vary by several times between runs. Use these results for relative comparison.
 
-**Execution Mode**: Full
+**Execution Mode**: Quick (--quick)
 **Python Version**: 3.11.9
 **Platform**: Windows-10-10.0.26300-SP0 (AMD64)
 **Logical CPU Cores**: 16
-**Command**: `python -m smartdialer.cli loadtest `
+**Command**: `python -m smartdialer.cli loadtest --quick`
 
 ## 1. Dispatch Throughput (`dispatch.start_progressive_call`)
 > [!NOTE]
@@ -15,33 +15,23 @@ Measured on a shared development machine with background processes running; abso
 
 | Agent Pool | Threads | Attempted | Reserved | Errors | Ops / Sec | Elapsed (s) | First Error |
 |---|---|---|---|---|---|---|---|
-| 100 | 1 | 100 | 100 | **0** | **1,013.7** | 0.099 | None |
-| 100 | 4 | 100 | 100 | **0** | **756.1** | 0.132 | None |
-| 100 | 8 | 100 | 100 | **0** | **508.1** | 0.197 | None |
-| 100 | 16 | 100 | 100 | **0** | **313.2** | 0.319 | None |
-| 1,000 | 1 | 1,000 | 1,000 | **0** | **944.7** | 1.059 | None |
-| 1,000 | 4 | 1,000 | 1,000 | **0** | **439.4** | 2.276 | None |
-| 1,000 | 8 | 1,000 | 1,000 | **0** | **251.8** | 3.972 | None |
-| 1,000 | 16 | 1,000 | 1,000 | **0** | **237.9** | 4.203 | None |
-| 10,000 | 1 | 10,000 | 10,000 | **0** | **275.9** | 36.241 | None |
-| 10,000 | 4 | 10,000 | 10,000 | **0** | **245.9** | 40.660 | None |
-| 10,000 | 8 | 10,000 | 10,000 | **0** | **244.9** | 40.826 | None |
-| 10,000 | 16 | 10,000 | 10,000 | **0** | **242.5** | 41.229 | None |
+| 100 | 1 | 50 | 50 | **0** | **1,235.9** | 0.040 | None |
+| 100 | 4 | 50 | 50 | **0** | **695.1** | 0.072 | None |
+| 500 | 1 | 50 | 50 | **0** | **1,279.9** | 0.039 | None |
+| 500 | 4 | 50 | 50 | **0** | **775.3** | 0.064 | None |
 
 ## 2. Event Processing Throughput (`apply_event`)
 | Threads | Events Processed | Ops / Sec | Elapsed (s) |
 |---|---|---|---|
-| 1 | 2,000 | **705.1** | 2.836 |
-| 4 | 2,000 | **582.0** | 3.436 |
-| 8 | 2,000 | **553.1** | 3.616 |
+| 1 | 400 | **2,643.2** | 0.151 |
+| 4 | 400 | **2,034.2** | 0.197 |
 
 ## 3. Safety Evaluation Latency & Exclusive Writer-Lock Hold Time
 ### 3.1 End-to-End Evaluation Latency (`SafetyController.evaluate`)
 | Agents | Historical Calls | p50 Latency (ms) | p95 Latency (ms) | Max Latency (ms) |
 |---|---|---|---|---|
-| 100 | 5,000 | 11.246 ms | 14.819 ms | 15.968 ms |
-| 1,000 | 5,000 | 18.104 ms | 23.763 ms | 24.566 ms |
-| 10,000 | 5,000 | 121.462 ms | 139.384 ms | 146.634 ms |
+| 100 | 500 | 1.011 ms | 1.544 ms | 1.544 ms |
+| 1,000 | 500 | 3.338 ms | 5.032 ms | 5.032 ms |
 
 ### 3.2 Writer-Lock Hold Time (BEGIN IMMEDIATE to COMMIT)
 > [!IMPORTANT]
@@ -49,8 +39,8 @@ Measured on a shared development machine with background processes running; abso
 
 | Agents | Historical Calls | Iterations | p50 Hold Time (ms) | p95 Hold Time (ms) | Max Hold Time (ms) |
 |---|---|---|---|---|---|
-| 1,000 | 10,000 | 25 | **25.929 ms** | 31.325 ms | 31.775 ms |
-| 10,000 | 100,000 | 25 | **443.761 ms** | 479.341 ms | 513.355 ms |
+| 100 | 500 | 5 | **0.712 ms** | 0.934 ms | 0.934 ms |
+| 1,000 | 2,000 | 5 | **3.950 ms** | 5.884 ms | 5.884 ms |
 
 ## 4. Single-Thread Dispatch Statement Breakdown at 10,000 Agents
 > [!NOTE]
@@ -59,18 +49,18 @@ Measured on a shared development machine with background processes running; abso
 >
 > Rewriting `claim_borrowers` and `reserve_agents` to first select candidate IDs via index range seek (`LIMIT ?`) and then update each candidate by Primary Key (`WHERE id = ? AND state = ...`) forces SQLite to execute a logarithmic point seek (`SEARCH USING INDEX sqlite_autoindex_*_1 (id=?)`), completely eliminating the O(N) pool scan (about 5x faster in an isolated single-thread 10,000-agent benchmark; the harness table below was measured on a busy machine and shows lower absolute numbers).
 
-- **Agent Pool**: 10,000
-- **Borrower Pool**: 20,000
-- **Measured Iterations**: 50
+- **Agent Pool**: 1,000
+- **Borrower Pool**: 2,000
+- **Measured Iterations**: 10
 
 | Statement / Phase | p50 Latency (ms) | Avg Latency (ms) | % of Total Time |
 |---|---|---|---|
-| `BEGIN IMMEDIATE;` | 0.053 ms | 0.060 ms | 2.1% |
-| `claim_borrower` (UPDATE borrowers) | 0.313 ms | 0.343 ms | 12.0% |
-| `reserve_agent` (UPDATE agents + audit) | 0.264 ms | 0.339 ms | 11.8% |
-| `create_call` (INSERT calls + events) | 0.271 ms | 0.406 ms | 14.2% |
-| `COMMIT;` (WAL Sync) | 0.732 ms | 1.713 ms | 59.7% |
-| **Total Dispatch Operation** | **1.655 ms** | **2.868 ms** | **100.0%** |
+| `BEGIN IMMEDIATE;` | 0.013 ms | 0.012 ms | 1.8% |
+| `claim_borrower` (UPDATE borrowers) | 0.067 ms | 0.082 ms | 12.6% |
+| `reserve_agent` (UPDATE agents + audit) | 0.064 ms | 0.072 ms | 11.1% |
+| `create_call` (INSERT calls + events) | 0.069 ms | 0.155 ms | 23.8% |
+| `COMMIT;` (WAL Sync) | 0.344 ms | 0.327 ms | 50.3% |
+| **Total Dispatch Operation** | **0.575 ms** | **0.650 ms** | **100.0%** |
 
 ### SQLite EXPLAIN QUERY PLAN (Dispatch Statements)
 
@@ -101,12 +91,8 @@ Measured on a shared development machine with background processes running; abso
 
 | Agents | Calls Table Rows | p50 Latency (ms) | p95 Latency (ms) | Max Latency (ms) |
 |---|---|---|---|---|
-| 100 | 10,000 | 21.133 ms | 24.381 ms | 25.589 ms |
-| 100 | 100,000 | 123.502 ms | 148.862 ms | 187.422 ms |
-| 1,000 | 10,000 | 9.055 ms | 12.124 ms | 13.174 ms |
-| 1,000 | 100,000 | 338.125 ms | 382.412 ms | 402.746 ms |
-| 10,000 | 10,000 | 24.169 ms | 30.939 ms | 33.258 ms |
-| 10,000 | 100,000 | 347.775 ms | 421.833 ms | 469.111 ms |
+| 100 | 500 | 0.538 ms | 0.905 ms | 0.905 ms |
+| 1,000 | 500 | 0.586 ms | 0.916 ms | 0.916 ms |
 
 ### EXPLAIN QUERY PLAN: Abandon Query Before vs. After Index
 
@@ -179,14 +165,13 @@ Measured on a shared development machine with background processes running; abso
 
 | Agent Capacity (cap) | `binom_tail_gt` Latency (ms) | `max_total_calls` Latency (ms) |
 |---|---|---|
-| 100 | 0.0203 ms | 0.4978 ms |
-| 1,000 | 0.0282 ms | 7.7862 ms |
-| 10,000 | 0.0175 ms | 113.5992 ms |
+| 100 | 0.0108 ms | 0.1932 ms |
+| 1,000 | 0.0092 ms | 2.7854 ms |
 
 ## 7. Concurrent Safety Lock Contention
 - **Threads**: 8 concurrent workers
 - **Agents**: 1,000
 - **SAFETY_ERROR Count**: **0** (Zero error invariant satisfied)
-- **p50 Lock Wait**: 66.002 ms
-- **p95 Lock Wait**: 138.755 ms
-- **Max Lock Wait**: 138.755 ms
+- **p50 Lock Wait**: 64.761 ms
+- **p95 Lock Wait**: 158.413 ms
+- **Max Lock Wait**: 158.413 ms
